@@ -1,2 +1,29 @@
 {:paths ["src"]
- :deps {}}
+ :deps {}
+ :tasks
+ {build {:doc "Build the C bridge"
+         :task (shell "make -C bridge")}
+
+  run {:doc  "Start tecla. Args: [--config PATH] [--device NAME] [--debug]"
+       :override-builtin true
+       :depends [build]
+       :task (let [start! (requiring-resolve 'tecla.core/start!)
+                   args   *command-line-args*
+                   pairs  (partition-all 2 args)
+                   opts   (reduce (fn [m [k v]]
+                                    (case k
+                                      "--config" (assoc m :config-path v)
+                                      "--port"   (assoc m :nrepl-port (parse-long v))
+                                      m))
+                                  {} pairs)]
+               (apply start! (mapcat identity opts)))}
+
+  test:fsm {:doc "Run FSM unit tests"
+            :task (load-file "test/fsm_test.clj")}
+
+  test:bridge {:doc "Run bridge integration tests (needs uinput access)"
+               :depends [build]
+               :task (load-file "test/bridge_test.clj")}
+
+  test {:doc "Run all tests"
+        :depends [test:fsm]}}}

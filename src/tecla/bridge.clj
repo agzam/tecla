@@ -1,6 +1,9 @@
 (ns tecla.bridge
-  "Socket client for tecla-bridge. Connects to the C bridge process,
-   sends configuration commands, and receives key events."
+  "Socket client for tecla-bridge. Connects to the C bridge,
+   receives raw key events, sends emit commands.
+
+   ALL keyboard logic lives here and in tecla.fsm - the bridge
+   is just an I/O pipe."
   (:require [tecla.keys :as keys]
             [clojure.string :as str]
             [babashka.process :as proc])
@@ -10,23 +13,20 @@
            [java.nio.charset StandardCharsets]))
 
 (def default-socket-path
-  (let [runtime (System/getenv "XDG_RUNTIME_DIR")]
-    (str (or runtime "/tmp") "/tecla-bridge.sock")))
+  (str (or (System/getenv "XDG_RUNTIME_DIR") "/tmp") "/tecla-bridge.sock"))
 
 (defonce state
   (atom {:channel nil
-         :device nil
-         :event-handler nil
-         :reader-thread nil
-         :running false}))
+         :running false
+         :on-key nil       ;; callback: (fn [code value]) for every key event
+         :devnode nil}))
 
 ;; ----------------------------------------------------------------
-;; Low-level socket I/O
+;; Low-level I/O
 ;; ----------------------------------------------------------------
 
 (defn- send-line [ch line]
-  (let [buf (ByteBuffer/wrap (.getBytes (str line "\n") StandardCharsets/UTF_8))]
-    (.write ch buf)))
+  (.write ch (ByteBuffer/wrap (.getBytes (str line "\n") StandardCharsets/UTF_8))))
 
 (defn- read-chunk [ch]
   (let [buf (ByteBuffer/allocate 4096)
@@ -38,46 +38,89 @@
         (String. bytes StandardCharsets/UTF_8)))))
 
 ;; ----------------------------------------------------------------
-;; Event reader thread
+;; Public API
 ;; ----------------------------------------------------------------
 
-(defn- parse-event
-  "Parse a line from the bridge into an event map."
-  [line]
+(defn emit!
+  "Emit a key event on the virtual keyboard."
+  [code value]
+  (let [code (if (keyword? code) (keys/key->code code) (int code))]
+    (when (and code (some? (:channel @state)))
+      (send-line (:channel @state) (format "EM %d %d" code value)))))
+
+(defn emit-key-tap!
+  "Press and release a key."
+  [code]
+  (emit! code 1)
+  (emit! code 0))
+
+(defn emit-combo!
+  "Emit a modifier+key combo (press mods, press key, release key, release mods)."
+  [mod-codes key-code]
+  (doseq [m mod-codes] (emit! m 1))
+  (emit! key-code 1)
+  (emit! key-code 0)
+  (doseq [m (reverse mod-codes)] (emit! m 0)))
+
+;; ----------------------------------------------------------------
+;; Reader thread
+;; ----------------------------------------------------------------
+
+(defn- parse-line [line on-key]
   (let [parts (str/split (str/trim line) #"\s+")]
     (case (first parts)
-      "HELLO"   {:type :hello :device (str/join " " (rest parts))}
-      "TRIGGER" {:type :trigger}
-      "KEY"     (let [code (parse-long (nth parts 1 "0"))
-                      value (parse-long (nth parts 2 "0"))]
-                  {:type :key
-                   :code code
-                   :key (get keys/code->key code :unknown)
-                   :value value
-                   :press? (= value 1)})
-      {:type :unknown :raw line})))
+      "EV" (let [code (parse-long (nth parts 1))
+                 value (parse-long (nth parts 2))]
+             (when on-key (on-key code value)))
+      "HELLO" (println "Bridge connected")
+      "DEVNODE" (do (swap! state assoc :devnode (second parts))
+                    (println "Bridge virtual device:" (second parts)))
+      nil)))
 
-(defn- reader-loop [ch handler]
+(defn- reader-loop [ch on-key]
   (let [partial (StringBuilder.)]
-    (try
-      (while (:running @state)
+    (while (:running @state)
+      (try
         (let [data (read-chunk ch)]
           (if (nil? data)
-            ;; No data - brief sleep to avoid busy-wait
-            (Thread/sleep 10)
+            (Thread/sleep 5)
             (do
               (.append partial data)
               (let [s (.toString partial)
                     lines (str/split s #"\n" -1)]
-                ;; Last element is incomplete line (or empty if ended with \n)
                 (.setLength partial 0)
                 (.append partial (last lines))
                 (doseq [line (butlast lines)]
                   (when-not (str/blank? line)
-                    (handler (parse-event line)))))))))
-      (catch Exception e
-        (when (:running @state)
-          (println "Bridge reader error:" (.getMessage e)))))))
+                    (parse-line line on-key)))))))
+        (catch Exception e
+          (when (:running @state)
+            (println "Bridge reader error:" (.getMessage e))
+            (println "  " (str e))
+            (Thread/sleep 100)))))))
+
+;; ----------------------------------------------------------------
+;; Connection management
+;; ----------------------------------------------------------------
+
+(defn connect!
+  "Connect to the bridge. on-key is called for every key event: (fn [code value])."
+  [on-key & {:keys [socket-path] :or {socket-path default-socket-path}}]
+  (let [addr (UnixDomainSocketAddress/of socket-path)
+        ch (SocketChannel/open StandardProtocolFamily/UNIX)]
+    (.connect ch addr)
+    (.configureBlocking ch false)
+    (swap! state assoc :channel ch :running true :on-key on-key)
+    (let [t (Thread. #(reader-loop ch on-key) "tecla-bridge-reader")]
+      (.setDaemon t true)
+      (.start t))
+    (println "Connected to bridge")))
+
+(defn disconnect! []
+  (swap! state assoc :running false)
+  (when-let [ch (:channel @state)]
+    (try (.close ch) (catch Exception _)))
+  (swap! state assoc :channel nil))
 
 ;; ----------------------------------------------------------------
 ;; Bridge process management
@@ -93,103 +136,23 @@
 
 (defn- bridge-running? [socket-path]
   (try
-    (let [addr (UnixDomainSocketAddress/of socket-path)
-          ch (SocketChannel/open StandardProtocolFamily/UNIX)]
-      (.connect ch addr)
-      (.close ch)
-      true)
+    (let [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
+      (.connect ch (UnixDomainSocketAddress/of socket-path))
+      (.close ch) true)
     (catch Exception _ false)))
 
 (defn start-bridge!
-  "Start the bridge process if not already running."
-  [{:keys [device socket-path debug?]
-    :or {socket-path default-socket-path
-         debug? false}}]
+  [{:keys [socket-path]
+    :or {socket-path default-socket-path}}]
   (if (bridge-running? socket-path)
-    (println "Bridge already running on" socket-path)
+    (println "Bridge already running")
     (let [bin (find-bridge-binary)]
-      (when-not bin
-        (throw (ex-info "Cannot find tecla-bridge binary" {})))
-      (let [args (cond-> [bin "--socket" socket-path]
-                   debug? (conj "--debug")
-                   device (conj device))]
+      (when-not bin (throw (ex-info "Cannot find tecla-bridge binary" {})))
+      (let [args [bin "--socket" socket-path]]
         (println "Starting bridge:" (str/join " " args))
-        (proc/process {:out :inherit :err :inherit :in :inherit}
-                      args)
-        ;; Wait for socket to appear
-        (loop [attempts 0]
-          (when (< attempts 20)
+        (apply proc/process {:out :inherit :err :inherit :in :inherit} args)
+        (loop [n 0]
+          (when (< n 20)
             (if (.exists (java.io.File. socket-path))
-              (Thread/sleep 200)  ;; extra settle time
-              (do (Thread/sleep 100)
-                  (recur (inc attempts))))))))))
-
-;; ----------------------------------------------------------------
-;; Public API
-;; ----------------------------------------------------------------
-
-(defn connect!
-  "Connect to the bridge socket. Starts reader thread with the given handler."
-  ([handler] (connect! handler {}))
-  ([handler {:keys [socket-path]
-             :or {socket-path default-socket-path}}]
-   (let [addr (UnixDomainSocketAddress/of socket-path)
-         ch (SocketChannel/open StandardProtocolFamily/UNIX)]
-     (.connect ch addr)
-     (.configureBlocking ch false)
-     (swap! state assoc
-            :channel ch
-            :event-handler handler
-            :running true)
-     (let [t (Thread. #(reader-loop ch handler) "tecla-bridge-reader")]
-       (.setDaemon t true)
-       (.start t)
-       (swap! state assoc :reader-thread t))
-     (println "Connected to bridge"))))
-
-(defn disconnect! []
-  (swap! state assoc :running false)
-  (when-let [ch (:channel @state)]
-    (try (.close ch) (catch Exception _)))
-  (swap! state assoc :channel nil :reader-thread nil))
-
-(defn send!
-  "Send a raw command to the bridge."
-  [cmd]
-  (when-let [ch (:channel @state)]
-    (send-line ch cmd)))
-
-(defn set-trigger!
-  "Configure the modal trigger key combo."
-  [mods key]
-  (let [mod-bits (keys/mods->bits mods)
-        key-code (get keys/key->code key)]
-    (when-not key-code
-      (throw (ex-info (str "Unknown key: " key) {:key key})))
-    (send! (format "SET_TRIGGER %d %d" mod-bits key-code))))
-
-(defn add-remap!
-  "Add a key remap. from/to are each [mods key], e.g. [:super :c] [:ctrl :c]."
-  [[from-mods from-key] [to-mods to-key]]
-  (let [fm (keys/mods->bits (if (keyword? from-mods) [from-mods] from-mods))
-        fk (get keys/key->code from-key)
-        tm (keys/mods->bits (if (keyword? to-mods) [to-mods] to-mods))
-        tk (get keys/key->code to-key)]
-    (when-not (and fk tk)
-      (throw (ex-info "Unknown key in remap"
-                      {:from-key from-key :to-key to-key})))
-    (send! (format "ADD_REMAP %d %d %d %d" fm fk tm tk))))
-
-(defn clear-remaps! []
-  (send! "CLEAR_REMAPS"))
-
-(defn emit-key!
-  "Emit a key event on the virtual keyboard."
-  [key value]
-  (let [code (if (keyword? key) (get keys/key->code key) key)]
-    (send! (format "EMIT %d %d" code value))))
-
-(defn exit-modal!
-  "Tell the bridge to exit modal mode and return to passthrough."
-  []
-  (send! "PASSTHROUGH"))
+              (Thread/sleep 200)
+              (do (Thread/sleep 100) (recur (inc n))))))))))

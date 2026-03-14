@@ -79,3 +79,35 @@
   "Convert a collection of modifier keywords like [:super :ctrl] to bitmask."
   [mods]
   (reduce (fn [acc m] (bit-or acc (get mod-bits m 0))) 0 mods))
+
+(def modifier-codes
+  "Set of keycodes that are modifiers."
+  #{29 97     ;; KEY_LEFTCTRL KEY_RIGHTCTRL
+    42 54     ;; KEY_LEFTSHIFT KEY_RIGHTSHIFT
+    56 100    ;; KEY_LEFTALT KEY_RIGHTALT
+    125 126}) ;; KEY_LEFTMETA KEY_RIGHTMETA
+
+(defn modifier-code?
+  "Is this evdev keycode a modifier?"
+  [code]
+  (contains? modifier-codes code))
+
+(defn code->mod-bit
+  "Return the modifier bitmask for a keycode, or 0."
+  [code]
+  (case (int code)
+    (29 97)   (:ctrl mod-bits)
+    (42 54)   (:shift mod-bits)
+    (56 100)  (:alt mod-bits)
+    (125 126) (:meta mod-bits)
+    0))
+
+(defn mod-bit->code
+  "Return the left-side keycode for a modifier bitmask bit."
+  [bit]
+  (case (int bit)
+    1 29    ;; CTRL -> KEY_LEFTCTRL
+    2 42    ;; SHIFT -> KEY_LEFTSHIFT
+    4 56    ;; ALT -> KEY_LEFTALT
+    8 125   ;; META -> KEY_LEFTMETA
+    nil))

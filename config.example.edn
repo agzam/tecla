@@ -1,7 +1,4 @@
-{;; Keyboard device name (substring match) or path
- :device "Adv360"
-
- ;; Key combo that opens the root modal
+{;; Key combo that opens the root modal
  :trigger {:mods [:super] :key :space}
 
  ;; Always-active remaps: [from] -> [to]
