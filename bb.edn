@@ -19,11 +19,14 @@
                (apply start! (mapcat identity opts)))}
 
   test:fsm {:doc "Run FSM unit tests"
-            :task (load-file "test/fsm_test.clj")}
+            :task (shell "bb test/fsm_test.clj")}
 
   test:bridge {:doc "Run bridge integration tests (needs uinput access)"
                :depends [build]
-               :task (load-file "test/bridge_test.clj")}
+               :task (shell "bb test/bridge_test.clj")}
+
+  test:core {:doc "Run core key processing tests"
+             :task (shell "bb test/core_test.clj")}
 
   test {:doc "Run all tests"
-        :depends [test:fsm]}}}
+        :depends [test:fsm test:core]}}}

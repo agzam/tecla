@@ -34,7 +34,7 @@
                 #(bit-or % bit)
                 #(bit-and % (bit-not bit)))))))
 
-(defn- compute-remap-mods
+(defn compute-remap-mods
   "Compute bitmask of all modifiers used in any remap rule."
   [config]
   (let [trigger-mod (keys/mods->bits (get-in config [:trigger :mods] []))]
@@ -135,11 +135,6 @@
 
 (defmethod execute-action :unknown [a]
   (println "Unknown action:" (pr-str a)))
-
-(defn- show-current-menu! []
-  (let [menu (fsm/current-menu @fsm-state)
-        title (or (:desc (meta menu)) "")]
-    (.start (Thread. (fn [] (try (hud/show! title menu) (catch Throwable _)))))))
 
 (defn handle-effect [effect]
   (when effect
@@ -278,6 +273,8 @@
 ;; ----------------------------------------------------------------
 
 (defn stop! []
+  (hud/stop!)
+  (hud/kill!)
   (when @nrepl-server
     (nrepl/stop-server! @nrepl-server)
     (reset! nrepl-server nil))
@@ -297,6 +294,9 @@
 
     (bridge/start-bridge! {:socket-path socket-path})
     (bridge/connect! on-key-event :socket-path socket-path)
+
+    ;; HUD polls FSM state on its own thread - zero coupling with key pipeline
+    (hud/start! fsm-state fsm/current-menu)
 
     (let [srv (try (nrepl/start-server! {:host "127.0.0.1" :port nrepl-port})
                    (catch java.net.BindException _
