@@ -1,9 +1,5 @@
 (ns tecla.bridge
-  "Socket client for tecla-bridge. Connects to the C bridge,
-   receives raw key events, sends emit commands.
-
-   ALL keyboard logic lives here and in tecla.fsm - the bridge
-   is just an I/O pipe."
+  "Socket client for tecla-bridge."
   (:require [tecla.keys :as keys]
             [clojure.string :as str]
             [babashka.process :as proc])
@@ -18,8 +14,9 @@
 (defonce state
   (atom {:channel nil
          :running false
-         :on-key nil       ;; callback: (fn [code value]) for every key event
-         :devnode nil}))
+         :on-key nil
+         :devnode nil
+         :bridge-proc nil}))
 
 ;; ----------------------------------------------------------------
 ;; Low-level I/O
@@ -41,25 +38,17 @@
 ;; Public API
 ;; ----------------------------------------------------------------
 
-(defn emit!
-  "Emit a key event on the virtual keyboard."
-  [code value]
+(defn emit! [code value]
   (let [code (if (keyword? code) (keys/key->code code) (int code))]
-    (when (and code (some? (:channel @state)))
+    (when (and code (:channel @state))
       (send-line (:channel @state) (format "EM %d %d" code value)))))
 
-(defn emit-key-tap!
-  "Press and release a key."
-  [code]
-  (emit! code 1)
-  (emit! code 0))
+(defn emit-key-tap! [code]
+  (emit! code 1) (emit! code 0))
 
-(defn emit-combo!
-  "Emit a modifier+key combo (press mods, press key, release key, release mods)."
-  [mod-codes key-code]
+(defn emit-combo! [mod-codes key-code]
   (doseq [m mod-codes] (emit! m 1))
-  (emit! key-code 1)
-  (emit! key-code 0)
+  (emit! key-code 1) (emit! key-code 0)
   (doseq [m (reverse mod-codes)] (emit! m 0)))
 
 ;; ----------------------------------------------------------------
@@ -74,7 +63,7 @@
              (when on-key (on-key code value)))
       "HELLO" (println "Bridge connected")
       "DEVNODE" (do (swap! state assoc :devnode (second parts))
-                    (println "Bridge virtual device:" (second parts)))
+                    (println "Virtual device:" (second parts)))
       nil)))
 
 (defn- reader-loop [ch on-key]
@@ -96,25 +85,35 @@
         (catch Exception e
           (when (:running @state)
             (println "Bridge reader error:" (.getMessage e))
-            (println "  " (str e))
             (Thread/sleep 100)))))))
 
 ;; ----------------------------------------------------------------
-;; Connection management
+;; Connection
 ;; ----------------------------------------------------------------
 
 (defn connect!
-  "Connect to the bridge. on-key is called for every key event: (fn [code value])."
-  [on-key & {:keys [socket-path] :or {socket-path default-socket-path}}]
-  (let [addr (UnixDomainSocketAddress/of socket-path)
-        ch (SocketChannel/open StandardProtocolFamily/UNIX)]
-    (.connect ch addr)
-    (.configureBlocking ch false)
-    (swap! state assoc :channel ch :running true :on-key on-key)
-    (let [t (Thread. #(reader-loop ch on-key) "tecla-bridge-reader")]
-      (.setDaemon t true)
-      (.start t))
-    (println "Connected to bridge")))
+  "Connect to the bridge with retries."
+  [on-key & {:keys [socket-path retries]
+             :or {socket-path default-socket-path retries 30}}]
+  (loop [attempt 0]
+    (let [ch (try
+               (let [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
+                 (.connect ch (UnixDomainSocketAddress/of socket-path))
+                 (.configureBlocking ch false)
+                 ch)
+               (catch Exception e
+                 (when (>= attempt retries)
+                   (throw (ex-info (str "Cannot connect to bridge: "
+                                        (.getMessage e)) {})))
+                 nil))]
+      (if ch
+        (do
+          (swap! state assoc :channel ch :running true :on-key on-key)
+          (let [t (Thread. #(reader-loop ch on-key) "tecla-bridge-reader")]
+            (.setDaemon t true)
+            (.start t))
+          (println "Connected to bridge"))
+        (do (Thread/sleep 200) (recur (inc attempt)))))))
 
 (defn disconnect! []
   (swap! state assoc :running false)
@@ -129,30 +128,43 @@
 (def bridge-bin "bridge/tecla-bridge")
 
 (defn- find-bridge-binary []
-  (let [candidates [(str (System/getProperty "user.dir") "/" bridge-bin)
-                    (str (System/getenv "HOME") "/.local/bin/tecla-bridge")
-                    "/usr/local/bin/tecla-bridge"]]
-    (first (filter #(.exists (java.io.File. %)) candidates))))
+  (first (filter #(.exists (java.io.File. %))
+                 [(str (System/getProperty "user.dir") "/" bridge-bin)
+                  (str (System/getenv "HOME") "/.local/bin/tecla-bridge")
+                  "/usr/local/bin/tecla-bridge"])))
 
-(defn- bridge-running? [socket-path]
-  (try
-    (let [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
-      (.connect ch (UnixDomainSocketAddress/of socket-path))
-      (.close ch) true)
-    (catch Exception _ false)))
+(defn stop-bridge! []
+  (when-let [p (:bridge-proc @state)]
+    (let [proc (:proc p)]
+      (try (.destroyForcibly proc) (catch Exception _))
+      (try (.waitFor proc 3 java.util.concurrent.TimeUnit/SECONDS)
+           (catch Exception _)))
+    (swap! state assoc :bridge-proc nil)))
 
 (defn start-bridge!
-  [{:keys [socket-path]
-    :or {socket-path default-socket-path}}]
-  (if (bridge-running? socket-path)
-    (println "Bridge already running")
-    (let [bin (find-bridge-binary)]
-      (when-not bin (throw (ex-info "Cannot find tecla-bridge binary" {})))
-      (let [args [bin "--socket" socket-path]]
-        (println "Starting bridge:" (str/join " " args))
-        (apply proc/process {:out :inherit :err :inherit :in :inherit} args)
-        (loop [n 0]
-          (when (< n 20)
-            (if (.exists (java.io.File. socket-path))
+  [{:keys [socket-path] :or {socket-path default-socket-path}}]
+  (let [bin (find-bridge-binary)]
+    (when-not bin (throw (ex-info "Cannot find tecla-bridge binary" {})))
+
+    ;; Kill any leftover bridge and clean stale socket
+    (stop-bridge!)
+    (let [f (java.io.File. socket-path)]
+      (when (.exists f) (.delete f)))
+
+    (let [args [bin "--socket" socket-path]
+          p (apply proc/process {:out :inherit :err :inherit :in :inherit} args)]
+      (println "Starting bridge:" (str/join " " args))
+      (swap! state assoc :bridge-proc p)
+
+      ;; Wait for bridge to be ready (accepting connections)
+      (loop [n 0]
+        (when (< n 30)
+          (let [ready (try
+                        (let [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
+                          (.connect ch (UnixDomainSocketAddress/of socket-path))
+                          (.close ch)
+                          true)
+                        (catch Exception _ false))]
+            (when-not ready
               (Thread/sleep 200)
-              (do (Thread/sleep 100) (recur (inc n))))))))))
+              (recur (inc n)))))))))

@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 
 #include <libevdev/libevdev.h>
@@ -30,6 +31,7 @@
 #define MAX_DEVICES 16
 
 static volatile int running = 1;
+static dev_t uinput_devnum = 0; /* our virtual device, skip during scan */
 
 static struct {
     struct libevdev *dev;
@@ -73,6 +75,9 @@ static void send_to_client(const char *fmt, ...) {
 /* ---- Device detection ---- */
 
 static int is_keyboard(struct libevdev *d) {
+    /* Skip virtual devices (uinput-created: Espanso, our own output, etc.) */
+    if (libevdev_get_id_bustype(d) == BUS_VIRTUAL)
+        return 0;
     return libevdev_has_event_type(d, EV_KEY)
         && libevdev_has_event_code(d, EV_KEY, KEY_A)
         && libevdev_has_event_code(d, EV_KEY, KEY_Z)
@@ -97,10 +102,51 @@ static void list_devices(void) {
     }
 }
 
+/* Remove a dead device */
+static void remove_device(int idx) {
+    fprintf(stderr, "  lost: %s\n", devices[idx].name);
+    if (devices[idx].dev) {
+        libevdev_grab(devices[idx].dev, LIBEVDEV_UNGRAB);
+        libevdev_free(devices[idx].dev);
+    }
+    if (devices[idx].fd >= 0) close(devices[idx].fd);
+    /* Shift remaining devices down */
+    for (int j = idx; j < device_count - 1; j++)
+        devices[j] = devices[j + 1];
+    device_count--;
+    memset(&devices[device_count], 0, sizeof(devices[0]));
+    devices[device_count].fd = -1;
+}
+
+/* Check if we already grabbed a device at this path */
+static int already_grabbed(int event_num) {
+    char path[64];
+    snprintf(path, sizeof(path), "/dev/input/event%d", event_num);
+    for (int i = 0; i < device_count; i++) {
+        /* Compare by fd's device/inode via path */
+        struct stat st1, st2;
+        if (fstat(devices[i].fd, &st1) == 0 && stat(path, &st2) == 0)
+            if (st1.st_dev == st2.st_dev && st1.st_ino == st2.st_ino)
+                return 1;
+    }
+    return 0;
+}
+
+/* Scan for keyboards, grab any new ones. Returns total device count. */
 static int grab_keyboards(void) {
     char path[64];
     for (int i = 0; i < 64 && device_count < MAX_DEVICES; i++) {
+        if (already_grabbed(i)) continue;
+
         snprintf(path, sizeof(path), "/dev/input/event%d", i);
+
+        /* Skip our own virtual device */
+        if (uinput_devnum) {
+            struct stat st;
+            if (stat(path, &st) == 0 && st.st_rdev == uinput_devnum)
+                continue;
+        }
+
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
 
@@ -222,7 +268,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "uinput: %s\n", strerror(-rc));
         return 1;
     }
-    fprintf(stderr, "Virtual: %s\n", libevdev_uinput_get_devnode(uidev));
+    const char *vdev = libevdev_uinput_get_devnode(uidev);
+    fprintf(stderr, "Virtual: %s\n", vdev);
+
+    /* Remember our own device so we don't grab it during rescan */
+    { struct stat st;
+      if (stat(vdev, &st) == 0) uinput_devnum = st.st_rdev; }
 
     /* Clear stale modifiers */
     static const int mods[] = { KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT,
@@ -236,10 +287,21 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Socket: %s\nReady.\n", socket_path);
 
     time_t start = time(NULL);
+    time_t last_scan = time(NULL);
     struct input_event ev;
 
     while (running) {
         if (timeout_sec > 0 && (time(NULL) - start) >= timeout_sec) break;
+
+        /* Rescan for new keyboards every 3 seconds */
+        time_t now = time(NULL);
+        if (now - last_scan >= 3) {
+            int before = device_count;
+            grab_keyboards();
+            if (device_count > before)
+                fprintf(stderr, "Now %d keyboard(s)\n", device_count);
+            last_scan = now;
+        }
 
         /* Build poll set: all keyboards + listen socket + client */
         struct pollfd pfds[MAX_DEVICES + 2];
@@ -285,6 +347,13 @@ int main(int argc, char **argv) {
 
         /* Keyboard events from ALL devices */
         for (int d = 0; d < device_count; d++) {
+            /* Device disconnected */
+            if (pfds[d].revents & (POLLHUP | POLLERR)) {
+                remove_device(d);
+                d--; /* re-check this index after shift */
+                continue;
+            }
+
             if (!(pfds[d].revents & POLLIN)) continue;
 
             do {
@@ -298,6 +367,12 @@ int main(int argc, char **argv) {
                                                  LIBEVDEV_READ_FLAG_SYNC, &ev);
                     }
                     continue;
+                }
+                if (rc < 0 && rc != -EAGAIN) {
+                    /* Read error - device likely disconnected */
+                    remove_device(d);
+                    d--;
+                    break;
                 }
                 if (rc < 0) break;
                 if (ev.type == EV_KEY && ev.value == 2) continue;

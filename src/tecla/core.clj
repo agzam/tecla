@@ -275,7 +275,8 @@
   (when @nrepl-server
     (nrepl/stop-server! @nrepl-server)
     (reset! nrepl-server nil))
-  (bridge/disconnect!))
+  (bridge/disconnect!)
+  (bridge/stop-bridge!))
 
 (defn start!
   [& {:keys [config-path socket-path nrepl-port]
