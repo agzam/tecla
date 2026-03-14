@@ -7,30 +7,27 @@
       :config     {...}          ;; full tecla config
       :effect     nil | effect}  ;; side effect to execute
 
-   Effects (returned, not executed):
-     {:type :action :action ...}   ;; execute an action
-     {:type :enter-modal}          ;; bridge should enter modal
-     {:type :exit-modal}           ;; bridge should exit modal
-     {:type :emit-key :key ... :value ...}")
+   Keymap entries can be:
+     {:desc \"...\" :action ...}             ;; leaf - execute action
+     {:desc \"...\" :keys {...}}             ;; submenu
+     {:desc \"...\" :transient true :keys {}} ;; transient submenu
+     :previous                               ;; go back one level
+     :root                                   ;; go back to root
+     :exit                                   ;; exit modal entirely")
 
-(defn init
-  "Create initial FSM state from config."
-  [config]
+(defn init [config]
   {:mode :idle
    :menu-stack []
    :config config
    :effect nil})
 
 (defn current-menu
-  "Return the currently active keymap level, or nil if not in modal."
   [{:keys [menu-stack config]}]
   (if (seq menu-stack)
     (peek menu-stack)
     (:root config)))
 
-(defn- lookup-key
-  "Look up a key in the current menu. Returns the entry map or nil."
-  [state key]
+(defn- lookup-key [state key]
   (when-let [menu (current-menu state)]
     (get menu key)))
 
@@ -38,9 +35,7 @@
 ;; Transitions
 ;; ----------------------------------------------------------------
 
-(defn trigger
-  "Handle modal trigger activation. Transitions :idle -> :modal."
-  [state]
+(defn trigger [state]
   (if (= (:mode state) :idle)
     (-> state
         (assoc :mode :modal
@@ -48,47 +43,59 @@
                :effect {:type :enter-modal}))
     state))
 
-(defn escape
-  "Handle escape / Ctrl+g. Pops menu stack or exits modal."
+(defn- exit-modal
+  "Exit modal entirely - back to idle."
   [state]
-  (if (not= (:mode state) :modal)
-    state
-    (let [stack (:menu-stack state)]
-      (if (< (count stack) 2)
-        ;; At root level - exit modal entirely
-        (-> state
-            (assoc :mode :idle
-                   :menu-stack []
-                   :effect {:type :exit-modal}))
-        ;; Pop one level
-        (-> state
-            (update :menu-stack pop)
-            (assoc :effect nil))))))
+  (-> state
+      (assoc :mode :idle
+             :menu-stack []
+             :effect {:type :exit-modal})))
+
+(defn- go-previous
+  "Pop one menu level, or exit if at root."
+  [state]
+  (let [stack (:menu-stack state)]
+    (if (< (count stack) 2)
+      (exit-modal state)
+      (-> state
+          (update :menu-stack pop)
+          (assoc :effect nil)))))
+
+(defn- go-root
+  "Jump back to root menu."
+  [state]
+  (-> state
+      (assoc :menu-stack [(get-in state [:config :root])])
+      (assoc :effect nil)))
 
 (defn handle-key
-  "Handle a key event in modal mode. Returns updated state.
-   Only processes key-down events (press? = true)."
+  "Handle a key event in modal mode. Only processes key-down (press? = true)."
   [state key press?]
   (if (or (not= (:mode state) :modal) (not press?))
     (assoc state :effect nil)
     (let [entry (lookup-key state key)]
       (cond
-        ;; No binding - swallow (no effect)
+        ;; No binding - swallow
         (nil? entry)
         (assoc state :effect nil)
 
-        ;; Submenu - push onto stack (carry :transient flag as metadata)
+        ;; Navigation keywords
+        (= entry :previous) (go-previous state)
+        (= entry :root)     (go-root state)
+        (= entry :exit)     (exit-modal state)
+
+        ;; Submenu - push onto stack
         (:keys entry)
         (-> state
             (update :menu-stack conj
                     (with-meta (:keys entry)
-                               {:transient (:transient entry)}))
+                               {:desc (:desc entry)
+                                :transient (:transient entry)}))
             (assoc :effect nil))
 
-        ;; Action leaf - execute action
+        ;; Action leaf
         (:action entry)
-        (let [;; Transient if the action itself or any parent submenu is transient
-              transient? (or (:transient entry)
+        (let [transient? (or (:transient entry)
                              (some #(:transient (meta %)) (:menu-stack state)))]
           (if transient?
             (assoc state :effect {:type :action :action (:action entry)})
@@ -97,19 +104,15 @@
                 (assoc :effect {:type :action-and-exit
                                 :action (:action entry)}))))
 
-        ;; Unrecognized entry shape
         :else
         (assoc state :effect nil)))))
 
-(defn process-event
-  "Main entry point. Process a bridge event, return updated FSM state.
-   Event shape: {:type :trigger | :key, :key keyword, :press? bool}"
-  [state event]
+(defn process-event [state event]
   (case (:type event)
     :trigger (trigger state)
     :key     (let [k (:key event)]
-               (if (#{:esc} k)
-                 (escape state)
+               ;; Escape always exits all modals (use :previous for back)
+               (if (= :esc k)
+                 (exit-modal state)
                  (handle-key state k (:press? event))))
-    ;; Unknown event type - no-op
     (assoc state :effect nil)))

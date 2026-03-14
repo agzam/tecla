@@ -3,6 +3,7 @@
   (:require [tecla.bridge :as bridge]
             [tecla.fsm :as fsm]
             [tecla.keys :as keys]
+            [tecla.hud :as hud]
             [babashka.nrepl.server :as nrepl]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -134,6 +135,11 @@
 
 (defmethod execute-action :unknown [a]
   (println "Unknown action:" (pr-str a)))
+
+(defn- show-current-menu! []
+  (let [menu (fsm/current-menu @fsm-state)
+        title (or (:desc (meta menu)) "")]
+    (.start (Thread. (fn [] (try (hud/show! title menu) (catch Throwable _)))))))
 
 (defn handle-effect [effect]
   (when effect
