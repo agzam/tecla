@@ -41,7 +41,9 @@ jobs:
           bb: latest
 
       - name: Build bridge
-        run: make -C bridge
+        run: |
+          make -C bridge
+          chmod +x bridge/tecla-bridge bridge/tecla-test-kbd
 
       - name: Run integration tests
         run: sudo $(which bb) test/bridge_test.clj

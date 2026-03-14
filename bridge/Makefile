@@ -7,9 +7,11 @@ all: tecla-bridge tecla-test-kbd
 
 tecla-bridge: tecla-bridge.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+	chmod 755 $@
 
 tecla-test-kbd: tecla-test-kbd.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+	chmod 755 $@
 
 clean:
 	rm -f tecla-bridge tecla-test-kbd

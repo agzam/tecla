@@ -13,12 +13,15 @@ and REPL-driven development via nREPL.
 - Provide nested modal menus activated by a trigger key (e.g., Super+Space)
 - Support global key remaps (e.g., Super+C -> Ctrl+C for Mac-like bindings)
 - Support per-application keymaps that activate based on focused window
-- Be configurable with plain Clojure data (maps, keywords, vectors)
+- Be configurable with plain Clojure data (EDN maps, keywords, vectors)
 - Support live development via nREPL (connect from Emacs/CIDER, modify keymaps
   and behavior at runtime)
 
 ## Non-goals
 
+- macOS support (spacehammer covers that; the core FSM/keymap logic is naturally
+  portable, but the I/O layer - evdev/uinput vs CGEventTap/DriverKit - shares
+  zero code, so cross-platform is not worth the complexity)
 - Graphical overlay/menu display (may be added later via external process, e.g.,
   eww, rofi)
 - Mouse remapping
@@ -26,10 +29,7 @@ and REPL-driven development via nREPL.
 
 ## Architecture
 
-### Input interception layer
-
-Tecla operates below the compositor by intercepting at the Linux evdev/uinput
-level:
+### Two-process design
 
 ```
 Physical KB
@@ -43,24 +43,47 @@ Physical KB
   -> compositor
 ```
 
-Two processes:
-
 1. **tecla-bridge** (C) - grabs the physical keyboard via libevdev, creates a
-   virtual keyboard via uinput. In passthrough mode, forwards events directly
-   (zero Babashka involvement, sub-microsecond). In modal mode, sends key events
-   to Babashka over a Unix socket and emits whatever Babashka sends back.
+   virtual keyboard via uinput. Operates in two modes:
+   - **Passthrough** - forwards events directly with remap table applied. Zero
+     Babashka involvement, sub-microsecond latency.
+   - **Modal** - non-modifier keys are sent to Babashka as `KEY` messages over
+     the Unix socket. Modifier keys are still forwarded to uinput. Babashka
+     sends `EMIT`/`PASSTHROUGH` commands back.
 
 2. **tecla** (Babashka) - connects to the bridge, configures remap tables and
-   the modal trigger key, runs the FSM when modal is active, provides nREPL for
-   live development.
+   the modal trigger key via socket commands, runs the FSM when modal is active,
+   provides nREPL for live development.
 
 The bridge requires access to `/dev/input/` and `/dev/uinput` - either as root
 or via `input` + `uinput` group membership. The Babashka process runs
 unprivileged.
 
+### Socket protocol
+
+Newline-delimited text messages over a Unix domain socket. Default path:
+`$XDG_RUNTIME_DIR/tecla-bridge.sock` (fallback: `/tmp/tecla-bridge.sock`).
+
+Bridge -> Babashka:
+- `HELLO <device-name>` - sent on client connection
+- `TRIGGER` - modal trigger key combo detected, bridge entered modal mode
+- `KEY <code> <value>` - key event in modal mode (code is evdev keycode,
+  value is 1=press, 0=release)
+
+Babashka -> Bridge:
+- `SET_TRIGGER <mod_bits> <keycode>` - configure the trigger combo
+- `ADD_REMAP <from_mod> <from_key> <to_mod> <to_key>` - add a remap entry
+- `CLEAR_REMAPS` - remove all remap entries
+- `EMIT <keycode> <value>` - emit a key event to the virtual keyboard
+- `SYN` - emit a SYN_REPORT event
+- `PASSTHROUGH` - exit modal mode, return to passthrough
+
+Modifier bitmask: 1=CTRL, 2=SHIFT, 4=ALT, 8=META/SUPER.
+
 ### FSM engine
 
-The core state machine manages modal navigation. States and transitions:
+The state machine lives in Babashka (`tecla.fsm`), implemented as pure
+functions with no I/O.
 
 ```
                 ┌──────────────────────────┐
@@ -70,7 +93,7 @@ The core state machine manages modal navigation. States and transitions:
   │ :idle │ --------> │ :modal │ ---------─┘
   └───────┘           └────────┘
                         │    ^
-                  key   │    │ :parent
+                  key   │    │ escape
                   with  │    │
                   :keys │    │
                         v    │
@@ -80,22 +103,31 @@ The core state machine manages modal navigation. States and transitions:
 ```
 
 States:
-- `:idle` - passthrough mode: remaps are applied, all other keys forwarded as-is
-- `:modal` - a modal menu is active: keys are consumed and matched against the
-  current keymap level
+- `:idle` - bridge is in passthrough mode
+- `:modal` - a modal menu is active, keys matched against current keymap level
 
 Transitions:
 - `trigger` (e.g., Super+Space) - `:idle` -> `:modal` (root menu)
-- `key with :keys` (submenu) - `:modal` -> `:modal` (push child menu onto stack)
+- `key with :keys` (submenu) - `:modal` -> `:modal` (push child onto stack)
 - `key with :action` (leaf) - `:modal` -> `:idle` (execute action, exit)
-- `key with :action + :transient`- `:modal` -> `:modal` (execute, stay in menu)
-- `escape / Ctrl+g` - `:modal` -> `:modal` (pop to parent) or -> `:idle` (if root)
+- `key with :action` in `:transient` submenu - `:modal` -> `:modal` (execute,
+  stay)
+- `escape` - `:modal` -> `:modal` (pop to parent) or -> `:idle` (if at root)
 - `unbound key` - swallowed (no effect while modal is active)
 
-The FSM context holds:
-- `:menu-stack` - vector of keymap levels (for :parent navigation)
-- `:pressed-keys` - currently held physical keys (for proper release handling)
-- `:timestamp` - for timeout-based transitions (future: tap vs hold)
+FSM state shape:
+```clojure
+{:mode       :idle | :modal
+ :menu-stack [keymap ...]   ; stack of keymap levels for parent navigation
+ :config     {...}          ; full tecla config map
+ :effect     nil | effect}  ; side effect to execute (consumed by core)
+```
+
+Effects (returned by FSM, executed by `tecla.core`):
+- `{:type :enter-modal}` - bridge enters modal (handled automatically)
+- `{:type :exit-modal}` - send PASSTHROUGH to bridge
+- `{:type :action :action ...}` - execute action, stay in modal (transient)
+- `{:type :action-and-exit :action ...}` - execute action, then exit modal
 
 ### Compositor adapter (focused window detection) - DEFERRED
 
@@ -118,50 +150,41 @@ Planned adapters:
 
 ### Action system
 
-Actions are what happen when a leaf key is pressed. An action can be:
+Actions are what happen when a leaf key is pressed. Dispatched by
+`tecla.core/execute-action` multimethod. An action can be:
 
-- A function (called directly)
-- A keyword (looked up in an action registry)
-- A string (executed as a shell command)
-- A vector `[:key mods key]` (synthesize a key event via uinput)
+- A string - executed as a shell command via `sh -c`
+- A function - called directly
+- A keyword - looked up in an action registry (NOT YET IMPLEMENTED)
+- A vector `[:key mods key]` - synthesize a key combo via bridge EMIT commands
 
 Examples:
 ```clojure
-;; function
-:action (fn [] (shell "emacs"))
-
-;; keyword (registered action)
-:action :wm/focus-left
-
-;; shell command
-:action "rofi -show drun"
-
-;; synthesize key
-:action [:key [:ctrl] :c]
+:action "rofi -show drun"          ; shell command
+:action (fn [] (shell "emacs"))    ; function (only in code, not EDN config)
+:action :wm/focus-left             ; keyword (registry - planned)
+:action [:key [:ctrl] :c]          ; synthesize Ctrl+C
 ```
 
 ## Configuration format
 
-Configuration is a plain Clojure map. The top-level structure:
+Configuration is a plain EDN file. Default path:
+`~/.config/tecla/config.edn`.
+
+Top-level structure:
 
 ```clojure
-{:device "AT Translated Set 2 keyboard"  ; or :auto to detect
- ;; :compositor :hyprland                  ; adapter selection (deferred)
+{:device "Adv360"                           ; device name substring or path
+ ;; :compositor :hyprland                    ; adapter selection (deferred)
 
  ;; the key combo that opens the root modal
  :trigger {:mods [:super] :key :space}
 
- ;; always-active key remaps (applied in :idle state)
+ ;; always-active key remaps (applied in passthrough mode by the C bridge)
  :remaps
  {[:super :c] [:ctrl :c]
   [:super :v] [:ctrl :v]
-  [:super :a] [:ctrl :a]
-  [:super :z] [:ctrl :z]
-  [:super :x] [:ctrl :x]
-  [:super :s] [:ctrl :s]
-  [:super :w] [:ctrl :w]
-  [:super :t] [:ctrl :t]
-  [:super :f] [:ctrl :f]}
+  [:super :a] [:ctrl :a]}
 
  ;; root modal keymap
  :root
@@ -171,31 +194,23 @@ Configuration is a plain Clojure map. The top-level structure:
              :t {:desc "Terminal" :action "kitty"}}}
 
   :w {:desc "Windows"
-      :keys {:h {:desc "←" :action :wm/focus-left}
-             :l {:desc "→" :action :wm/focus-right}
-             :j {:desc "↓" :action :wm/focus-down}
-             :k {:desc "↑" :action :wm/focus-up}
-             :, {:desc "Resize"
-                 :transient true
-                 :keys {:h {:desc "shrink-x" :action :wm/shrink-x}
-                        :l {:desc "grow-x"   :action :wm/grow-x}}}}}
+      :keys {:h {:desc "Left"  :action "hyprctl dispatch movefocus l"}
+             :l {:desc "Right" :action "hyprctl dispatch movefocus r"}
+             :comma {:desc "Resize"
+                     :transient true
+                     :keys {:h {:desc "shrink" :action "resize -20 0"}
+                            :l {:desc "grow"   :action "resize 20 0"}}}}}
 
   :b {:desc "Buffers/Tabs"
       :keys {:n {:desc "Next" :action [:key [:ctrl] :tab]}
              :p {:desc "Prev" :action [:key [:ctrl :shift] :tab]}}}}
 
- ;; per-application keymaps
- ;; trigger: Super+, (comma) by default, configurable per app
- :apps
- {"brave-browser"
-  {:trigger {:mods [:super] :key :comma}
-   :keys {:o {:desc "Open in..."
-              :keys {:e {:desc "Editor" :action :browser/open-in-editor}}}
-          :t {:desc "Translate page" :action :browser/translate}}}
-
-  "emacs"
-  {:trigger {:mods [:super] :key :comma}
-   :keys {:r {:desc "Reload config" :action "emacsclient -e '(reload-init)'"}}}}}
+ ;; per-application keymaps (requires compositor adapter - DEFERRED)
+ ;; :apps
+ ;; {"brave-browser"
+ ;;  {:trigger {:mods [:super] :key :comma}
+ ;;   :keys {:o {:desc "Open in..." :keys {:e {:desc "Editor" :action ...}}}}}}
+ }
 ```
 
 ### Keymap entry shapes
@@ -204,102 +219,136 @@ A key entry is a map. It is either a leaf (has `:action`) or a submenu (has
 `:keys`):
 
 ```clojure
-;; Leaf - executes action, exits modal (unless :transient)
-{:desc "Description"        ; required - shown in menu display
- :action <action>           ; required - see Action system
- :transient true}           ; optional - stay in current modal after action
+;; Leaf - executes action, exits modal (unless inside a :transient submenu)
+{:desc "Description"        ; shown in menu display
+ :action <action>}          ; see Action system
 
 ;; Submenu - opens a nested modal level
-{:desc "Description"        ; required
- :keys {<key> <entry> ...}} ; required - nested keymap
+{:desc "Description"
+ :transient true            ; optional - actions within stay in modal
+ :keys {<key> <entry> ...}} ; nested keymap
 ```
 
-The key in a keymap is a keyword corresponding to the key name: `:a`, `:b`,
-`:space`, `:tab`, `:return`, `:1`, `:f1`, etc.
-
-For key chords (key + modifier) as map keys, use a vector: `[:ctrl :a]`,
-`[:shift :tab]`.
+Keys in a keymap are keywords matching `tecla.keys/key->code`:
+`:a`, `:b`, `:space`, `:tab`, `:return`, `:comma`, `:dot`, `:f1`, etc.
 
 ## Module structure
 
 ```
 tecla/
 ├── bridge/
-│   ├── tecla-bridge.c         ; C bridge: evdev/uinput + socket
-│   └── Makefile
+│   ├── tecla-bridge.c         ; C bridge: evdev/uinput + socket server
+│   ├── tecla-test-kbd.c       ; virtual keyboard for integration testing
+│   ├── Makefile
+│   └── .clangd                ; LSP config for editor
 ├── src/
 │   └── tecla/
-│       ├── core.clj           ; entry point, config loading, nREPL start
+│       ├── core.clj           ; entry point, config, nREPL, effect dispatch
 │       ├── fsm.clj            ; state machine engine (pure functions)
-│       ├── keymap.clj         ; keymap parsing, lookup, stack operations
-│       ├── bridge.clj         ; Unix socket communication with C bridge
-│       ├── remap.clj          ; always-on remap logic (idle state)
-│       ├── action.clj         ; action dispatch (shell, key synth, fn call)
-│       ├── keys.clj           ; keycode <-> keyword mapping tables
-│       └── adapters/          ; DEFERRED - for per-app keymaps
-│           └── ...
-├── config.example.clj         ; example user configuration
+│       ├── bridge.clj         ; socket client, bridge process management
+│       └── keys.clj           ; keycode <-> keyword mapping tables
+├── test/
+│   ├── fsm_test.clj           ; FSM unit tests (pure, no I/O)
+│   └── bridge_test.clj        ; bridge integration tests (virtual keyboard)
+├── .github/
+│   └── workflows/
+│       └── test.yml           ; CI: FSM tests + bridge integration tests
+├── config.example.edn         ; example user configuration
 ├── bb.edn                     ; Babashka project config
-├── SPEC.md
-├── README.md
-└── LICENSE
+└── SPEC.md
 ```
 
 ## Runtime lifecycle
 
-1. Load config from `~/.config/tecla/config.jank` (or specified path)
-2. Start nREPL server on a configured port
-3. Open evdev device, grab exclusive access
-4. Create uinput virtual device
-5. Enter main loop:
-   - Read `input_event` from evdev
-   - If key event: pass to FSM
-   - FSM returns: `{:emit [events...] :state new-state :effect side-effect}`
-   - Write emitted events to uinput
-   - Execute any side effects (run action, update menu display)
-6. On SIGTERM/SIGINT: release evdev grab, destroy uinput device, exit
+1. Start tecla-bridge (C):
+   - Find keyboard device by name or path
+   - Grab exclusive access via libevdev
+   - Create virtual keyboard via uinput
+   - Release stale modifier state on virtual device
+   - Listen on Unix domain socket
+
+2. Start tecla (Babashka):
+   - Load config from `~/.config/tecla/config.edn`
+   - Start bridge process (if not already running)
+   - Connect to bridge socket, start reader thread
+   - Send `SET_TRIGGER` and `ADD_REMAP` commands from config
+   - Start nREPL server (default port 7888)
+   - Block on event loop
+
+3. Runtime:
+   - Bridge passthrough mode: all keys forwarded with remap table applied
+   - When trigger combo detected: bridge enters modal, sends `TRIGGER` to BB
+   - BB FSM processes key events, sends `EMIT`/`PASSTHROUGH` back
+   - Actions executed as side effects (shell commands, key synthesis)
+
+4. Shutdown:
+   - Bridge: SIGTERM/SIGINT -> release evdev grab, destroy uinput, close socket
+   - BB: disconnect from socket, stop nREPL
 
 ## Key handling details
 
 ### Modifier passthrough in modal state
 
 When a modal is active, modifier keys (Shift, Ctrl, Alt, Super) are still
-forwarded to the virtual device. This allows modal keys to be combined with
-modifiers if the keymap supports it, and prevents stuck modifiers on exit.
+forwarded to the virtual device by the C bridge. Non-modifier keys are sent to
+Babashka as KEY messages. This prevents stuck modifiers on modal exit.
 
 ### Key repeat
 
-Key repeat events (`value == 2` in `input_event`) are forwarded in `:idle`
-state and swallowed in `:modal` state (unless the current action is
-`:transient` and `:repeatable`).
+Key repeat events (`value == 2` in `input_event`) are dropped unconditionally
+by the C bridge. The virtual keyboard generates its own repeats from
+press/release events, matching the system's configured repeat rate.
 
-### Device hot-plug
+### Remap mechanics
 
-When configured with `:device :auto`, tecla monitors `/dev/input/` for new
-devices matching keyboard capabilities and automatically grabs them. This
-handles USB keyboard connect/disconnect.
+Remaps are a lookup table in the C bridge, configured via `ADD_REMAP` commands.
+When a matching key+modifier combo is detected:
+
+1. Release the source modifier(s) on uinput
+2. Press the target modifier(s)
+3. Press the target key
+4. On key release: reverse the modifier swap, restore physical state
+
+### Device hot-plug - NOT YET IMPLEMENTED
+
+When implemented, `:device :auto` will monitor `/dev/input/` for new devices
+matching keyboard capabilities and automatically grab them.
 
 ## Development workflow
 
-1. Start tecla: `sudo tecla` (or via systemd service with appropriate
-   permissions)
-2. Connect to nREPL from Emacs: `M-x cider-connect` -> localhost:7888
-3. Modify keymaps live:
+1. Build: `make -C bridge`
+2. Start: `bb -m tecla.core/start!` (or via a wrapper script)
+3. Connect nREPL from Emacs: `M-x cider-connect` -> localhost:7888
+4. Modify keymaps live:
    ```clojure
-   ;; in REPL
    (tecla.core/update-config!
      assoc-in [:root :x] {:desc "Test" :action "notify-send 'hello'"})
    ```
-4. Changes take effect immediately - no restart needed
-5. Iterate on FSM logic, add new actions, test compositor adapters - all from
-   the REPL
+5. Changes take effect immediately - no restart needed
+
+## Testing
+
+- `bb test/fsm_test.clj` - FSM unit tests (pure functions, instant, no
+  hardware)
+- `bb test/bridge_test.clj` - integration tests (starts a virtual keyboard via
+  `tecla-test-kbd`, starts the bridge, exercises socket protocol)
+- CI: GitHub Actions runs both test suites. Bridge tests need `sudo` for
+  uinput access.
 
 ## Security considerations
 
-- Tecla requires elevated access to input devices - this is inherent to
+- The bridge process requires elevated access to input devices - inherent to
   evdev-level interception
-- The process should run as a dedicated user in `input` + `uinput` groups,
-  not as root when possible
-- `PrivateNetwork=true` in the systemd unit to prevent network access
+- Run the bridge as a dedicated user in `input` + `uinput` groups when possible
+- nREPL binds to localhost only (127.0.0.1)
 - Config file should be owned by the user, not world-writable
-- nREPL should bind to localhost only
+
+## Not yet implemented
+
+- Compositor adapters for per-app keymaps
+- Action keyword registry
+- Device hot-plug
+- Ctrl+g as modal escape (currently only Escape key)
+- Graphical which-key overlay
+- systemd unit file
+- Wrapper script / CLI entry point
