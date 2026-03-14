@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  fsm-tests:
-    name: FSM unit tests
+  unit-tests:
+    name: Unit tests (FSM + Core)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +20,9 @@ jobs:
 
       - name: Run FSM tests
         run: bb test/fsm_test.clj
+
+      - name: Run core key processing tests
+        run: bb test/core_test.clj
 
   bridge-tests:
     name: Bridge integration tests

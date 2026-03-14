@@ -4,7 +4,7 @@
  {build {:doc "Build the C bridge"
          :task (shell "make -C bridge")}
 
-  run {:doc  "Start tecla. Args: [--config PATH] [--device NAME] [--debug]"
+  run {:doc  "Start tecla. Args: [--config PATH] [--port PORT]"
        :override-builtin true
        :depends [build]
        :task (let [start! (requiring-resolve 'tecla.core/start!)
@@ -28,5 +28,8 @@
   test:core {:doc "Run core key processing tests"
              :task (shell "bb test/core_test.clj")}
 
-  test {:doc "Run all tests"
+  test:hud {:doc "Run HUD tests (needs eww + display)"
+            :task (shell "bb test/hud_test.clj")}
+
+  test {:doc "Run all unit tests"
         :depends [test:fsm test:core]}}}
