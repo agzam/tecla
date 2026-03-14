@@ -1,0 +1,35 @@
+{;; Keyboard device name (substring match) or path
+ :device "Adv360"
+
+ ;; Key combo that opens the root modal
+ :trigger {:mods [:super] :key :space}
+
+ ;; Always-active remaps: [from] -> [to]
+ ;; Each side is [modifier... key]
+ :remaps
+ {[:super :c] [:ctrl :c]
+  [:super :v] [:ctrl :v]
+  [:super :a] [:ctrl :a]
+  [:super :z] [:ctrl :z]
+  [:super :x] [:ctrl :x]
+  [:super :s] [:ctrl :s]
+  [:super :w] [:ctrl :w]
+  [:super :t] [:ctrl :t]
+  [:super :f] [:ctrl :f]}
+
+ ;; Root modal keymap
+ :root
+ {:a {:desc "Apps"
+      :keys {:e {:desc "Emacs"    :action "emacsclient -c"}
+             :b {:desc "Browser"  :action "brave"}
+             :t {:desc "Terminal" :action "kitty"}}}
+
+  :w {:desc "Windows"
+      :keys {:h {:desc "Left"  :action "hyprctl dispatch movefocus l"}
+             :l {:desc "Right" :action "hyprctl dispatch movefocus r"}
+             :j {:desc "Down"  :action "hyprctl dispatch movefocus d"}
+             :k {:desc "Up"    :action "hyprctl dispatch movefocus u"}}}
+
+  :b {:desc "Buffers/Tabs"
+      :keys {:n {:desc "Next" :action [:key [:ctrl] :tab]}
+             :p {:desc "Prev" :action [:key [:ctrl :shift] :tab]}}}}}
