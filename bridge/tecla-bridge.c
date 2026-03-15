@@ -568,11 +568,17 @@ int main(int argc, char **argv) {
                 if (rc == LIBEVDEV_READ_STATUS_SYNC) {
                     while (rc == LIBEVDEV_READ_STATUS_SYNC) {
                         if (ev.type != EV_KEY) {
-                            if (client_fd < 0)
-                                libevdev_uinput_write_event(
-                                    uidev, ev.type, ev.code, ev.value);
+                            libevdev_uinput_write_event(
+                                uidev, ev.type, ev.code, ev.value);
                         } else if (ev.value == 2) {
-                            /* skip autorepeat during sync */
+                            /* Forward repeat for passthrough keys */
+                            if (client_fd < 0) {
+                                libevdev_uinput_write_event(
+                                    uidev, EV_KEY, ev.code, 2);
+                            } else if (fp_active && key_state[ev.code]
+                                       && !fp_sent[ev.code]) {
+                                fp_emit(ev.code, 2);
+                            }
                         } else if ((ev.value == 1 && key_state[ev.code]) ||
                                    (ev.value == 0 && !key_state[ev.code])) {
                             /* skip duplicate */
@@ -596,15 +602,27 @@ int main(int argc, char **argv) {
                 }
                 if (rc < 0) break;
                 if (ev.type != EV_KEY) {
-                    /* Non-key events: only pass through when no client
-                     * (client mode uses fp_emit/process_command which
-                     *  generate their own SYN_REPORT) */
-                    if (client_fd < 0)
-                        libevdev_uinput_write_event(
-                            uidev, ev.type, ev.code, ev.value);
+                    /* Pass through non-key events (incl. SYN_REPORT)
+                     * so the virtual keyboard preserves the physical
+                     * keyboard's event framing. */
+                    libevdev_uinput_write_event(
+                        uidev, ev.type, ev.code, ev.value);
                     continue;
                 }
-                if (ev.value == 2) continue; /* drop autorepeat */
+                if (ev.value == 2) {
+                    /* Forward autorepeat for keys on the direct
+                     * passthrough path (never touched the client).
+                     * Drop it for keys routed through the client -
+                     * the compositor provides repeat for those. */
+                    if (client_fd < 0) {
+                        libevdev_uinput_write_event(
+                            uidev, EV_KEY, ev.code, 2);
+                    } else if (fp_active && key_state[ev.code]
+                               && !fp_sent[ev.code]) {
+                        fp_emit(ev.code, 2);
+                    }
+                    continue;
+                }
 
                 /* De-duplicate: if multiple devices report the same
                  * physical key, only the first event gets through. */
