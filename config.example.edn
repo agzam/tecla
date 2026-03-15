@@ -17,14 +17,14 @@
   {:desc "Main"
    :keys
    {:a {:desc "Apps"
-        :keys {:e {:desc "Emacs"
-                   :action (wm/focus-or-launch "Emacs" "emacs")}
+        :keys {:e {:desc "Emacs" :action (wm/focus-or-launch "Emacs" "emacs")}
+               :i {:desc "Kitty" :action (wm/focus-or-launch "kitty" "kitty")}
                :b {:desc "Brave"
                    :action (wm/focus-or-launch "brave-browser"
                              "brave --enable-features=UseOzonePlatform")}
-               :p {:desc "Brave Private"
-                   :action (wm/focus-or-launch "initialTitle:New Private Tab.*"
-                             "brave --enable-features=UseOzonePlatform --incognito")}
+               [:shift :b] {:desc "Brave Private"
+                            :action (wm/focus-or-launch "initialTitle:New Private Tab.*"
+                                     "brave --enable-features=UseOzonePlatform --incognito")}
                :s {:desc "Slack"
                    :action (wm/focus-or-launch "Slack")}
                :q {:desc "qBittorrent"

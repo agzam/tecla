@@ -8,7 +8,7 @@ on:
 
 jobs:
   unit-tests:
-    name: Unit tests (FSM + Core)
+    name: Unit tests (FSM + Core + HUD)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +23,9 @@ jobs:
 
       - name: Run core key processing tests
         run: bb test/core_test.clj
+
+      - name: Run HUD poller tests
+        run: bb test/hud_test.clj
 
   bridge-tests:
     name: Bridge integration tests

@@ -87,10 +87,23 @@
       (when-let [code (keys/key->code (keyword (str "left-" (name m))))]
         (bridge/emit! code 0)))))
 
+(def ^:private form-aliases
+  "Short namespace aliases for config EDN forms."
+  {"wm" "tecla.wm"})
+
+(defn- expand-sym
+  "Expand short aliases: wm/focus-left -> tecla.wm/focus-left"
+  [sym]
+  (if-let [ns-part (namespace sym)]
+    (if-let [full-ns (form-aliases ns-part)]
+      (symbol full-ns (name sym))
+      sym)
+    sym))
+
 (defn- dispatch-form!
-  "Dispatch a list form like (wm/focus-left) or (my.actions/launch \"kitty\")."
+  "Dispatch a list form like (wm/focus-left) or (my.ns/launch \"kitty\")."
   [form]
-  (let [sym (first form)
+  (let [sym (expand-sym (first form))
         args (rest form)]
     (if-let [resolved (try (requiring-resolve sym) (catch Exception _ nil))]
       (future (apply resolved args))
@@ -111,16 +124,23 @@
 ;; ----------------------------------------------------------------
 
 (defn- handle-sim-press!
-  "Handle a keymap match that simulates keys. Track for release."
+  "Handle a keymap match that remaps keys. Press target mods + key,
+   track for release in handle-sim-release!."
   [state mod-state code combo]
-  ;; Consume source modifiers, emit target combo
   (swap! state (fn [s]
                  (-> s
                      (update :consumed-mods bit-or (bit-and mod-state (:buffered-mods s)))
                      (update :buffered-mods #(bit-and % (bit-not mod-state)))
                      (assoc-in [:active-sims code]
                                {:from-mods mod-state :to-combo combo}))))
-  (simulate-keys! combo))
+  ;; Press only - release happens in handle-sim-release!
+  (let [mods (butlast combo)
+        key (last combo)]
+    (doseq [m mods]
+      (when-let [kc (keys/key->code (keyword (str "left-" (name m))))]
+        (bridge/emit! kc 1)))
+    (when-let [kc (keys/key->code key)]
+      (bridge/emit! kc 1))))
 
 (defn- handle-sim-release!
   "Handle key release for an active simulation. Returns true if handled."

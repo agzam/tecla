@@ -1,18 +1,30 @@
 (ns tecla.hud
-  "Which-key overlay using eww. Polls FSM state on its own thread.
+  "Which-key overlay via GTK4 (gjs). Polls FSM state on its own thread.
+   Uses gtk4-layer-shell on wlr compositors, plain GTK4 window on GNOME.
    Completely decoupled from key processing - can never interfere."
-  (:require [clojure.java.shell :refer [sh]]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [babashka.process :as proc]))
 
-(def eww-config-dir
-  (str (System/getProperty "user.dir") "/eww"))
+(def ^:private hud-script
+  (str (System/getProperty "user.dir") "/hud/tecla-hud-gtk.js"))
 
-(defn- eww! [& args]
-  (try (apply sh "eww" "--config" eww-config-dir args) nil
-       (catch Throwable _ nil)))
+(defonce ^:private hud-proc (atom nil))
+(defonce ^:private poller-running (atom false))
 
-(defn- menu->json [menu]
+;; ----------------------------------------------------------------
+;; IPC: write JSON lines to gjs stdin
+;; ----------------------------------------------------------------
+
+(defn- send! [json-str]
+  (when-let [p @hud-proc]
+    (when (.isAlive ^java.lang.Process (:proc p))
+      (try
+        (let [out ^java.io.OutputStream (:in p)]
+          (.write out (.getBytes (str json-str "\n") "UTF-8"))
+          (.flush out))
+        (catch Throwable _)))))
+
+(defn- menu->keys-json [menu]
   (let [items (keep (fn [[k entry]]
                       (when (and (map? entry) (:desc entry))
                         (str "{\"key\":\"" (name k) "\""
@@ -20,38 +32,20 @@
                     menu)]
     (str "[" (str/join "," items) "]")))
 
-(defn kill! []
-  (try (sh "eww" "--config" eww-config-dir "kill")
-       (catch Throwable _)))
+(defn- show-menu! [menu]
+  (let [title (or (:desc (meta menu)) "")
+        keys-json (menu->keys-json menu)]
+    (send! (str "{\"show\":true,\"name\":\"" title
+                "\",\"keys\":" keys-json "}"))))
 
-(defn- daemon-ready? []
-  (try
-    (zero? (:exit (sh "eww" "--config" eww-config-dir "get" "current-modal-name")))
-    (catch Throwable _ false)))
+(defn- hide-menu! []
+  (send! "{\"show\":false}"))
 
-(defn init!
-  "Start the eww daemon and wait until it's ready."
-  []
-  ;; Spawn daemon in background (don't use sh - it blocks)
-  (try
-    (proc/process {:out :inherit :err :inherit}
-                  "eww" "--config" eww-config-dir "daemon")
-    (catch Throwable _))
-  ;; Wait for daemon to be responsive
-  (loop [n 0]
-    (when (and (< n 30) (not (daemon-ready?)))
-      (Thread/sleep 200)
-      (recur (inc n))))
-  ;; Set initial empty values
-  (eww! "update" "current-modal-name=")
-  (eww! "update" "current-modal-keys=[]"))
+;; ----------------------------------------------------------------
+;; Poller
+;; ----------------------------------------------------------------
 
-(defonce ^:private poller-running (atom false))
-
-(defn start!
-  "Start the HUD poller. Watches fsm-state on its own thread,
-   updates eww when modal state changes. Never touches the key pipeline."
-  [fsm-state-atom current-menu-fn]
+(defn- start-poller! [fsm-state-atom current-menu-fn]
   (reset! poller-running true)
   (doto (Thread.
           (fn []
@@ -68,18 +62,13 @@
                       (and (= :modal mode)
                            (or (not= :modal (:mode p))
                                (not= stack-id (:stack-id p))))
-                      (let [menu (current-menu-fn s)
-                            title (or (:desc (meta menu)) "")
-                            json (menu->json menu)]
-                        (eww! "close" "modal")
-                        (eww! "update" (str "current-modal-name=" title))
-                        (eww! "update" (str "current-modal-keys=" json))
-                        (eww! "open" "modal")
+                      (let [menu (current-menu-fn s)]
+                        (show-menu! menu)
                         (reset! prev {:mode mode :stack-id stack-id}))
 
                       ;; Left modal
                       (and (= :modal (:mode p)) (not= :modal mode))
-                      (do (eww! "close" "modal")
+                      (do (hide-menu!)
                           (reset! prev {:mode mode :stack-id nil}))
 
                       ;; No change
@@ -89,6 +78,28 @@
     (.setDaemon true)
     (.start)))
 
+;; ----------------------------------------------------------------
+;; Lifecycle
+;; ----------------------------------------------------------------
+
+(defn kill! []
+  (when-let [p @hud-proc]
+    (try (send! "{\"quit\":true}") (catch Throwable _))
+    (try (.destroyForcibly ^java.lang.Process (:proc p)) (catch Throwable _))
+    (reset! hud-proc nil)))
+
 (defn stop! []
   (reset! poller-running false)
-  (eww! "close" "modal"))
+  (try (hide-menu!) (catch Throwable _))
+  (kill!))
+
+(defn start!
+  "Start the GTK HUD process and poller thread. Watches fsm-state,
+   sends show/hide commands. Never touches the key pipeline."
+  [fsm-state-atom current-menu-fn]
+  (kill!)
+  (let [p (proc/process {:in :pipe :out :inherit :err :inherit}
+                        "gjs" hud-script)]
+    (reset! hud-proc p)
+    (Thread/sleep 300))
+  (start-poller! fsm-state-atom current-menu-fn))

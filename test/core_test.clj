@@ -207,6 +207,31 @@
   (combo SUPER KEY_T)
   (assert= true (emitted? CTRL 1) "Ctrl"))
 
+;; Remap hold behavior (press-only on key-down, release on key-up)
+
+(deftest "remap holds: no release until source key released"
+  (reset-state!)
+  (press SUPER)
+  (press KEY_T)
+  ;; At this point: Ctrl and T should be pressed, but NOT released
+  (assert= true (emitted? CTRL 1) "Ctrl pressed")
+  (assert= true (emitted? KEY_T 1) "T pressed")
+  (assert= true (not-emitted? KEY_T 0) "T NOT released yet")
+  (assert= true (not-emitted? CTRL 0) "Ctrl NOT released yet")
+  ;; Now release source key
+  (release KEY_T)
+  (assert= true (emitted? KEY_T 0) "T released")
+  (assert= true (emitted? CTRL 0) "Ctrl released"))
+
+;; Symbol expansion in dispatch-form!
+
+(deftest "expand-sym resolves wm/ alias"
+  (reset-state!)
+  (let [expanded (#'core/expand-sym 'wm/focus-left)]
+    (assert= 'tecla.wm/focus-left expanded "wm -> tecla.wm"))
+  (let [unchanged (#'core/expand-sym 'some.other.ns/foo)]
+    (assert= 'some.other.ns/foo unchanged "fully-qualified unchanged")))
+
 ;; State cleanliness
 
 (deftest "kbd-state clean after action"
