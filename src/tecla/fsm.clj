@@ -13,7 +13,8 @@
      {:desc ... :transient true :keys {}} ;; transient submenu
      :previous                         ;; go back one level
      :root                             ;; jump to root of current modal
-     :exit                             ;; exit modal entirely")
+     :exit                             ;; exit modal entirely"
+  (:require [tecla.keys :as keys]))
 
 (defn init [config]
   {:mode :idle
@@ -26,9 +27,16 @@
   (when (seq menu-stack)
     (peek menu-stack)))
 
-(defn- lookup-key [state key]
+(defn- lookup-key
+  "Look up a key in the current menu. When modifiers are active,
+   try the vector form first (e.g. [:shift :b]), then fall back
+   to the bare keyword."
+  [state key mods]
   (when-let [menu (current-menu state)]
-    (get menu key)))
+    (if-let [mod-kws (keys/bits->mods mods)]
+      (or (get menu (vec (concat mod-kws [key])))
+          (get menu key))
+      (get menu key))))
 
 ;; ----------------------------------------------------------------
 ;; Transitions
@@ -68,10 +76,10 @@
       state)))
 
 (defn handle-key
-  [state key press?]
+  [state key mods press?]
   (if (or (not= (:mode state) :modal) (not press?))
     (assoc state :effect nil)
-    (let [entry (lookup-key state key)]
+    (let [entry (lookup-key state key mods)]
       (cond
         (nil? entry)
         (assoc state :effect nil)
@@ -107,5 +115,5 @@
     :key (let [k (:key event)]
            (if (= :esc k)
              (exit-modal state)
-             (handle-key state k (:press? event))))
+             (handle-key state k (or (:mods event) 0) (:press? event))))
     (assoc state :effect nil)))

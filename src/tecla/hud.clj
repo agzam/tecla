@@ -24,10 +24,17 @@
           (.flush out))
         (catch Throwable _)))))
 
+(defn- key-label
+  "Human-readable label for a menu key: :b -> \"b\", [:shift :b] -> \"shift+b\"."
+  [k]
+  (if (vector? k)
+    (str/join "+" (map name k))
+    (name k)))
+
 (defn- menu->keys-json [menu]
   (let [items (keep (fn [[k entry]]
                       (when (and (map? entry) (:desc entry))
-                        (str "{\"key\":\"" (name k) "\""
+                        (str "{\"key\":\"" (key-label k) "\""
                              ",\"desc\":\"" (:desc entry) "\"}")))
                     menu)]
     (str "[" (str/join "," items) "]")))

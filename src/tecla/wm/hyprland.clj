@@ -2,6 +2,7 @@
   "Hyprland backend for wm/action. Communicates via Hyprland's
    Unix domain socket IPC, not by shelling out to hyprctl."
   (:require [tecla.wm :as wm]
+            [cheshire.core :as json]
             [clojure.string :as str])
   (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
            [java.nio.channels SocketChannel]
@@ -36,27 +37,23 @@
               candidates)))))
 
 (defn- hypr-cmd
-  "Send a command to Hyprland via its IPC socket. Returns response string."
+  "Send a command to Hyprland via its IPC socket. Returns parsed JSON."
   [cmd]
   (when-let [sock-path (find-socket)]
     (try
-      (let [addr (UnixDomainSocketAddress/of sock-path)
-            ch (SocketChannel/open StandardProtocolFamily/UNIX)]
-        (.connect ch addr)
-        (.configureBlocking ch true)
-        ;; Prepend j/ for JSON output
-        (let [cmd-str (str "j/" cmd)
-              write-buf (ByteBuffer/wrap (.getBytes cmd-str StandardCharsets/UTF_8))]
-          (.write ch write-buf))
-        ;; Read response
-        (let [read-buf (ByteBuffer/allocate 65536)
-              n (.read ch read-buf)]
-          (.close ch)
-          (when (pos? n)
-            (.flip read-buf)
-            (let [bytes (byte-array n)]
-              (.get read-buf bytes)
-              (String. bytes StandardCharsets/UTF_8)))))
+      (let [cmd-str (cond->> cmd (keyword? cmd) name (string? cmd) identity
+                             :always (str "j/"))]
+        (with-open [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
+          (.connect ch (UnixDomainSocketAddress/of sock-path))
+          (let [write-buf (ByteBuffer/wrap (.getBytes cmd-str StandardCharsets/UTF_8))]
+            (.write ch write-buf))
+          (let [read-buf (ByteBuffer/allocate (int 1e7))
+                n (.read ch read-buf)]
+            (when (pos? n)
+              (.flip read-buf)
+              (let [raw (String. (.array read-buf) 0 n "UTF-8")]
+                (try (json/parse-string raw true)
+                     (catch Exception _ raw)))))))
       (catch Exception e
         (println "hypr-cmd error:" (.getMessage e))
         nil))))
@@ -87,31 +84,25 @@
 (defmethod wm/action [:hyprland :resize-active] [_ dx dy & _]
   (dispatch (str "resizeactive " dx " " dy)))
 
-(defmethod wm/action [:hyprland :focus-or-launch] [_ designator & [app-cmd]]
-  (let [app-cmd (or app-cmd designator)
-        ;; Parse key:pattern syntax
-        [match-key match-pattern]
-        (if (str/includes? designator ":")
-          (str/split designator #":" 2)
-          ["class" designator])
-        match-key (keyword match-key)
-        clients (hypr-cmd "clients")
-        ;; Find matching client in JSON array
-        found (when clients
-                (re-find
-                  (re-pattern
-                    (str "\"address\":\\s*\"(0x[^\"]+)\"[^}]*\""
-                         (name match-key) "\":\\s*\""
-                         match-pattern "\""))
-                  clients))]
-    (if found
-      (dispatch (str "focuswindow address:" (second found)))
-      (dispatch (str "exec " app-cmd)))))
+(defmethod wm/action [:hyprland :focus-or-launch] [_ opts]
+  (let [{:keys [class command]} opts
+        command (or command class)
+        designator (str/lower-case class)
+        [key pattern] (if (str/includes? designator ":")
+                        (let [[k v] (str/split designator #":" 2)]
+                          [(keyword k) v])
+                        [:class designator])
+        regex (re-pattern (str "(?i)" pattern))
+        matching (->> (hypr-cmd :clients)
+                      (some #(when (and (contains? % key)
+                                       (re-find regex
+                                                 (str/lower-case
+                                                  (str (get % key)))))
+                               %)))]
+    (if matching
+      (dispatch (str "focuswindow address:" (:address matching)))
+      (dispatch (str "exec " command)))))
 
 (defmethod wm/action [:hyprland :focused-window] [& _]
-  (when-let [raw (hypr-cmd "activewindow")]
-    ;; Quick extraction without a JSON parser
-    (let [class-match (re-find #"\"class\":\s*\"([^\"]+)\"" raw)
-          title-match (re-find #"\"title\":\s*\"([^\"]*)\""  raw)]
-      {:class (second class-match)
-       :title (second title-match)})))
+  (when-let [w (hypr-cmd "activewindow")]
+    (select-keys w [:class :title])))

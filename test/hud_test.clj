@@ -62,7 +62,8 @@
     [:super :space]
     {:desc "Main"
      :keys {:a {:desc "Apps"
-                :keys {:e {:desc "Emacs" :action "echo emacs"}}}
+                :keys {:e {:desc "Emacs" :action "echo emacs"}
+                       [:shift :b] {:desc "Brave Private" :action "echo bp"}}}
             :x {:desc "Execute" :action "echo exec"}}}}})
 
 (defn reset-state! []
@@ -103,7 +104,10 @@
   (Thread/sleep 200)
   (assert= true (last-is-show?) "show sent")
   (assert= true (sent-contains? "Emacs") "contains Emacs")
-  (assert= true (sent-contains? "Apps") "title is Apps"))
+  (assert= true (sent-contains? "Apps") "title is Apps")
+  ;; Vector key [:shift :b] should render as "shift+b"
+  (assert= true (sent-contains? "shift+b") "vector key label")
+  (assert= true (sent-contains? "Brave Private") "vector key desc"))
 
 (deftest "escape sends hide"
   (clear-sent!)

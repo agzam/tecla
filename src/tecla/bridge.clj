@@ -24,9 +24,13 @@
 ;; ----------------------------------------------------------------
 
 (defn- send-line [ch line]
-  (let [buf (ByteBuffer/wrap (.getBytes (str line "\n") StandardCharsets/UTF_8))]
-    (while (.hasRemaining buf)
-      (.write ch buf))))
+  (try
+    (let [buf (ByteBuffer/wrap (.getBytes (str line "\n") StandardCharsets/UTF_8))]
+      (while (.hasRemaining buf)
+        (.write ch buf)))
+    (catch java.io.IOException _
+      (println "Bridge connection lost")
+      (swap! state assoc :channel nil))))
 
 ;; ----------------------------------------------------------------
 ;; Public API
@@ -227,12 +231,14 @@
       ;; Wait for bridge to be ready (accepting connections)
       (loop [n 0]
         (when (< n 30)
-          (let [ready (try
-                        (let [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
-                          (.connect ch (UnixDomainSocketAddress/of socket-path))
-                          (.close ch)
-                          true)
-                        (catch Exception _ false))]
-            (when-not ready
-              (Thread/sleep 200)
-              (recur (inc n)))))))))
+          ;; Check if bridge exited early
+          (when (.isAlive ^java.lang.Process (:proc p))
+            (let [ready (try
+                          (let [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
+                            (.connect ch (UnixDomainSocketAddress/of socket-path))
+                            (.close ch)
+                            true)
+                          (catch Exception _ false))]
+              (when-not ready
+                (Thread/sleep 200)
+                (recur (inc n))))))))))

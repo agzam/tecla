@@ -125,15 +125,15 @@
 ;; focus-or-launch
 ;; ----------------------------------------------------------------
 
-(defmethod wm/action [:gnome :focus-or-launch] [_ designator & [app-cmd]]
-  (let [app-cmd (or app-cmd designator)
-        ;; Strip key:pattern prefix if present (Hyprland syntax)
-        designator (if (str/includes? designator ":")
-                     (second (str/split designator #":" 2))
-                     designator)]
+(defmethod wm/action [:gnome :focus-or-launch] [_ opts]
+  (let [{:keys [class command]} opts
+        command (or command class)
+        designator (if (str/includes? class ":")
+                     (second (str/split class #":" 2))
+                     class)]
     (if-let [w (find-window-by-class designator)]
       (focus-window! (:id w))
-      (sh "sh" "-c" app-cmd))))
+      (sh "sh" "-c" command))))
 
 ;; ----------------------------------------------------------------
 ;; Info queries

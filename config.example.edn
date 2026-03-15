@@ -17,18 +17,21 @@
   {:desc "Main"
    :keys
    {:a {:desc "Apps"
-        :keys {:e {:desc "Emacs" :action (wm/focus-or-launch "Emacs" "emacs")}
-               :i {:desc "Kitty" :action (wm/focus-or-launch "kitty" "kitty")}
+        :keys {:e {:desc "Emacs" :action (wm/focus-or-launch {:class "Emacs" :command "emacs"})}
+               :i {:desc "Kitty" :action (wm/focus-or-launch {:class "kitty"})}
                :b {:desc "Brave"
-                   :action (wm/focus-or-launch "brave-browser"
-                             "brave --enable-features=UseOzonePlatform")}
+                   :action (wm/focus-or-launch
+                            {:class "brave-browser"
+                             :command "brave --enable-features=UseOzonePlatform"})}
                [:shift :b] {:desc "Brave Private"
-                            :action (wm/focus-or-launch "initialTitle:New Private Tab.*"
-                                     "brave --enable-features=UseOzonePlatform --incognito")}
+                            :action (wm/focus-or-launch
+                                     {:class "initialTitle:New Private Tab.*"
+                                      :command "brave --enable-features=UseOzonePlatform --incognito"})}
                :s {:desc "Slack"
-                   :action (wm/focus-or-launch "Slack")}
+                   :action (wm/focus-or-launch {:class "Slack" :command "slack"})}
                :q {:desc "qBittorrent"
-                   :action (wm/focus-or-launch "org.qbittorrent.qBittorrent" "qbittorrent")}}}
+                   :action (wm/focus-or-launch {:class "org.qbittorrent.qBittorrent"
+                                                :command "qbittorrent"})}}}
 
     :w {:desc "Windows"
         :keys {:h {:desc "Left"  :action (wm/focus-left)}

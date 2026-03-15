@@ -35,14 +35,20 @@
               :comma {:desc "Resize" :transient true
                       :keys {:h {:desc "Shrink" :action "shrink"}
                              :l {:desc "Grow" :action "grow"}}}}}
-   :x {:desc "Execute" :action "rofi -show drun"}})
+   :x {:desc "Execute" :action "rofi -show drun"}
+   :t {:desc "Test mods"
+       :keys {:b {:desc "Plain B" :action "plain-b"}
+              [:shift :b] {:desc "Shift B" :action "shift-b"}
+              [:ctrl :shift :x] {:desc "Ctrl+Shift+X" :action "csx"}}}})
 
 (def modal-entry {:desc "Main" :keys root-menu})
 (def config {:global-keymap {[:super :space] modal-entry}})
 
 (defn fresh [] (fsm/init config))
 (defn ev-enter [] {:type :enter-modal :entry modal-entry})
-(defn ev [k] {:type :key :key k :press? true})
+(defn ev
+  ([k] {:type :key :key k :press? true})
+  ([k mods] {:type :key :key k :mods mods :press? true}))
 (defn ev-release [k] {:type :key :key k :press? false})
 
 (defn pipeline [& events]
@@ -197,6 +203,28 @@
 (deftest "re-trigger after escape"
   (let [s (pipeline (ev-enter) (ev :a) (ev :esc) (ev-enter))]
     (assert= :modal (:mode s) "modal")))
+
+;; ---- Modifier+key in modal menus ----
+
+(deftest "modal: bare :b with mods=0 matches plain entry"
+  (let [s (pipeline (ev-enter) (ev :t) (ev :b 0))]
+    (assert= :idle (:mode s) "action exits modal")
+    (assert= "plain-b" (get-in (:effect s) [:action]) "matched plain :b")))
+
+(deftest "modal: :b with mods=shift matches [:shift :b]"
+  (let [s (pipeline (ev-enter) (ev :t) (ev :b 2))]
+    (assert= :idle (:mode s) "action exits modal")
+    (assert= "shift-b" (get-in (:effect s) [:action]) "matched [:shift :b]")))
+
+(deftest "modal: :x with mods=ctrl+shift matches [:ctrl :shift :x]"
+  (let [s (pipeline (ev-enter) (ev :t) (ev :x 3))] ;; ctrl=1 + shift=2 = 3
+    (assert= :idle (:mode s) "action exits modal")
+    (assert= "csx" (get-in (:effect s) [:action]) "matched [:ctrl :shift :x]")))
+
+(deftest "modal: :b with no mods field falls back to plain"
+  (let [s (pipeline (ev-enter) (ev :t) (ev :b))]
+    (assert= :idle (:mode s) "action exits modal")
+    (assert= "plain-b" (get-in (:effect s) [:action]) "old events without mods still work")))
 
 ;; ================================================================
 (println)

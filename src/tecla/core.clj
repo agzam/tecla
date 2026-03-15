@@ -209,12 +209,18 @@
       ;; === MODAL MODE ===
       (= :modal (:mode @fsm-state))
       (cond
-        is-mod (bridge/emit! code value)
+        ;; Modifiers are tracked (mod-state updated above) but NOT
+        ;; emitted during modal mode. They are only used for matching
+        ;; modifier+key menu entries like [:shift :b]. On exit-modal,
+        ;; any still-held modifiers are re-emitted for passthrough.
+        is-mod nil
 
         press?
         (let [key-kw (keys/code->key code)
+              mods   (:mod-state @state)
               new-fsm (swap! fsm-state fsm/process-event
-                             {:type :key :key key-kw :press? true})]
+                             {:type :key :key key-kw
+                              :mods mods :press? true})]
           (handle-effect (:effect new-fsm))
           (swap! fsm-state assoc :effect nil))
 
@@ -296,7 +302,18 @@
            (str (System/getenv "HOME") "/.config"))
        "/tecla/config.edn"))
 
+(defn- ensure-config!
+  "Copy config.example.edn to `path` if it doesn't exist yet."
+  [path]
+  (when-not (.exists (io/file path))
+    (let [example (io/file (System/getProperty "user.dir") "config.example.edn")]
+      (when (.exists example)
+        (.mkdirs (.getParentFile (io/file path)))
+        (spit path (slurp example))
+        (println "Created" path "from config.example.edn")))))
+
 (defn load-config [path]
+  (ensure-config! path)
   (if (.exists (io/file path))
     (edn/read-string (slurp path))
     (throw (ex-info (str "Config not found: " path) {:path path}))))

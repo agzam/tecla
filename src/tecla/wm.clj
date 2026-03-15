@@ -40,5 +40,17 @@
 (defn workspace-next [& args] (apply action :workspace-next args))
 (defn workspace-prev [& args] (apply action :workspace-prev args))
 (defn focused-window    [& args] (apply action :focused-window args))
-(defn focus-or-launch   [& args] (apply action :focus-or-launch args))
+(defn focus-or-launch
+  "Focus a window matching :class (or :initialTitle, etc.), or launch :command.
+   (wm/focus-or-launch {:class \"kitty\" :command \"kitty\"})
+   (wm/focus-or-launch {:class \"kitty\"})  ;; command defaults to class
+   Legacy positional form also works:
+   (wm/focus-or-launch \"kitty\")
+   (wm/focus-or-launch \"kitty\" \"kitty --title foo\")"
+  ([opts-or-class]
+   (if (map? opts-or-class)
+     (action :focus-or-launch opts-or-class)
+     (action :focus-or-launch {:class (str opts-or-class)})))
+  ([class command]
+   (action :focus-or-launch {:class (str class) :command (str command)})))
 (defn resize-active     [& args] (apply action :resize-active args))

@@ -35,19 +35,14 @@ window.tecla-hud {
     font-weight: bold;
     margin-bottom: 10px;
 }
-.tecla-row {
-    margin-bottom: 2px;
-}
 .tecla-key {
     color: #89b4fa;
     font-family: monospace;
     font-size: 16px;
-    min-width: 32px;
 }
 .tecla-desc {
     color: #bac2de;
     font-size: 15px;
-    margin-left: 12px;
 }
 `;
 
@@ -91,7 +86,7 @@ function buildUI() {
     titleLabel.add_css_class('tecla-title');
     outer.append(titleLabel);
 
-    keysBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 3 });
+    keysBox = new Gtk.Grid({ row_spacing: 3, column_spacing: 12 });
     outer.append(keysBox);
 
     win.set_child(outer);
@@ -99,6 +94,7 @@ function buildUI() {
 }
 
 function clearKeys() {
+    // Grid has no remove-all; walk children
     let child = keysBox.get_first_child();
     while (child) {
         let next = child.get_next_sibling();
@@ -118,11 +114,8 @@ function handleCommand(obj) {
     if (obj.show && win) {
         titleLabel.set_label(obj.name || '');
         clearKeys();
+        let row = 0;
         for (let item of (obj.keys || [])) {
-            let row = new Gtk.Box({
-                orientation: Gtk.Orientation.HORIZONTAL, spacing: 4
-            });
-            row.add_css_class('tecla-row');
             let k = new Gtk.Label({
                 label: item.key || '', halign: Gtk.Align.START
             });
@@ -131,9 +124,9 @@ function handleCommand(obj) {
                 label: item.desc || '', halign: Gtk.Align.START
             });
             d.add_css_class('tecla-desc');
-            row.append(k);
-            row.append(d);
-            keysBox.append(row);
+            keysBox.attach(k, 0, row, 1, 1);
+            keysBox.attach(d, 1, row, 1, 1);
+            row++;
         }
         win.set_visible(true);
         // present() needed for initial map; layer-shell ignores focus

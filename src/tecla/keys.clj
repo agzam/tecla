@@ -80,6 +80,18 @@
   [mods]
   (reduce (fn [acc m] (bit-or acc (get mod-bits m 0))) 0 mods))
 
+(def ^:private bit->mod-sorted
+  "Ordered pairs so bits->mods always produces [:ctrl :shift :alt :meta]."
+  [[1 :ctrl] [2 :shift] [4 :alt] [8 :meta]])
+
+(defn bits->mods
+  "Convert a modifier bitmask to a seq of modifier keywords in canonical
+   order (ctrl, shift, alt, meta). Returns nil when the bitmask is zero."
+  [bits]
+  (when-not (zero? bits)
+    (keep (fn [[b m]] (when-not (zero? (bit-and bits b)) m))
+          bit->mod-sorted)))
+
 (def modifier-codes
   "Set of keycodes that are modifiers."
   #{29 97     ;; KEY_LEFTCTRL KEY_RIGHTCTRL

@@ -20,7 +20,7 @@ FSM, config, and REPL-driven development via nREPL.
 ## Non-goals
 
 - macOS support (spacehammer covers that; the I/O layer shares zero code)
-- Graphical overlay/menu display (future: external process, e.g., eww, rofi)
+- Graphical overlay/menu display beyond the built-in GTK4 which-key HUD
 - Mouse remapping
 - Hardware-level key remapping (firmware, QMK, etc.)
 
@@ -143,30 +143,39 @@ Dispatched by `tecla.core/execute-action`:
 
 ## Configuration
 
-EDN file at `~/.config/tecla/config.edn`. No `:device` key - the bridge grabs
-all keyboards automatically.
+EDN file at `~/.config/tecla/config.edn`. If the file does not exist on first
+run, it is copied from `config.example.edn`.
+
+The bridge grabs all keyboards automatically - no `:device` key needed.
 
 ```clojure
-{:trigger {:mods [:super] :key :space}
-
- :remaps
- {[:super :c] [:ctrl :c]
+{:global-keymap
+ {;; Remaps (active in passthrough mode)
+  [:super :c] [:ctrl :c]
   [:super :v] [:ctrl :v]
-  [:super :a] [:ctrl :a]}
 
- :root
- {:a {:desc "Apps"
-      :keys {:e {:desc "Emacs"    :action "emacsclient -c"}
-             :b {:desc "Browser"  :action "brave"}}}
-
-  :w {:desc "Windows"
-      :keys {:h {:desc "Left"  :action "hyprctl dispatch movefocus l"}
-             :comma {:desc "Resize" :transient true
-                     :keys {:h {:desc "shrink" :action "resize -20 0"}}}}}}}
+  ;; Modal trigger + menu tree
+  [:super :space]
+  {:desc "Main"
+   :keys
+   {:a {:desc "Apps"
+        :keys {:e {:desc "Emacs"
+                   :action (wm/focus-or-launch {:class "Emacs" :command "emacs"})}
+               [:shift :b] {:desc "Brave Private"
+                            :action (wm/focus-or-launch
+                                     {:class "initialTitle:New Private Tab.*"
+                                      :command "brave --incognito"})}}}
+    :w {:desc "Windows"
+        :keys {:h {:desc "Left" :action (wm/focus-left)}}}}}}}
 ```
 
 Keymap entries: leaf `{:desc "..." :action ...}` or submenu
-`{:desc "..." :keys {...}}`. Keys are keywords: `:a`, `:space`, `:comma`, etc.
+`{:desc "..." :keys {...}}`. Keys are keywords (`:a`, `:space`) or
+modifier+key vectors (`[:shift :b]`, `[:ctrl :shift :x]`).
+
+`wm/focus-or-launch` accepts a map with `:class` and optional `:command`
+(defaults to `:class`). Legacy positional syntax also works:
+`(wm/focus-or-launch "kitty")` or `(wm/focus-or-launch "kitty" "kitty -T foo")`.
 
 ## Module structure
 
@@ -176,17 +185,24 @@ tecla/
 │   ├── tecla-bridge.c          ; C bridge: grab all KBs, EV/EM socket I/O
 │   ├── tecla-test-kbd.c        ; virtual keyboard for tests
 │   ├── tecla-test-monitor.c    ; output observer for tests
-│   ├── Makefile
-│   └── .clangd
+│   └── Makefile
+├── hud/
+│   └── tecla-hud-gtk.js        ; GTK4 which-key overlay (gjs)
 ├── src/tecla/
 │   ├── core.clj                ; entry point, all keyboard logic, nREPL
 │   ├── fsm.clj                 ; modal state machine (pure functions)
 │   ├── bridge.clj              ; socket client, bridge process management
-│   └── keys.clj                ; keycode <-> keyword tables
+│   ├── keys.clj                ; keycode <-> keyword tables
+│   ├── hud.clj                 ; which-key HUD poller (drives GTK process)
+│   ├── wm.clj                  ; compositor-agnostic WM multimethod
+│   └── wm/
+│       ├── hyprland.clj        ; Hyprland backend (IPC socket + cheshire)
+│       └── gnome.clj           ; GNOME backend (window-calls extension)
 ├── test/
 │   ├── fsm_test.clj            ; FSM unit tests
+│   ├── core_test.clj           ; key processing + modal modifier tests
+│   ├── hud_test.clj            ; HUD poller tests
 │   └── bridge_test.clj         ; bridge integration tests
-├── .github/workflows/test.yml
 ├── config.example.edn
 ├── bb.edn
 └── SPEC.md
@@ -194,14 +210,15 @@ tecla/
 
 ## Runtime lifecycle
 
-1. `bb run` builds bridge, loads config, starts bridge process, connects socket,
+1. `bb run` builds bridge, copies config.example.edn if needed, detects
+   compositor, starts bridge process, connects socket, starts HUD (GTK4),
    starts nREPL (port 7890)
 2. Bridge scans and grabs all keyboards, creates virtual keyboard, listens on
-   socket
+   socket, watches /dev/input via inotify for hot-plug
 3. Every key event: bridge sends `EV` -> Babashka processes (remap/modal/
    passthrough) -> sends `EM` commands back
 4. Shutdown: bridge releases grabs, destroys uinput; Babashka disconnects, stops
-   nREPL
+   nREPL, kills HUD
 
 ## Testing
 
@@ -246,9 +263,7 @@ timer would all be forwarded during the burst.
 
 ## Not yet implemented
 
-- Compositor adapters for per-app keymaps
+- Per-app keymaps (compositor adapter detects focused window, merges local keymap)
 - Action keyword registry
-- Device hot-plug monitoring
 - Ctrl+g as modal escape
-- Graphical which-key overlay
 - systemd unit file

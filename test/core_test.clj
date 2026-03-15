@@ -29,8 +29,8 @@
 (defn clear! [] (reset! emitted []))
 (alter-var-root #'bridge/emit! (constantly mock-emit!))
 
-(def SUPER 125) (def CTRL 29) (def SPACE 57)
-(def KEY_A 30) (def KEY_E 18) (def KEY_T 20)
+(def SUPER 125) (def CTRL 29) (def SHIFT 42) (def ALT 56) (def SPACE 57)
+(def KEY_A 30) (def KEY_B 48) (def KEY_E 18) (def KEY_T 20)
 (def KEY_W 17) (def KEY_H 35) (def KEY_X 45) (def KEY_ESC 1)
 
 (defn press [c] (core/on-key-event c 1))
@@ -49,6 +49,9 @@
     {:desc "Main"
      :keys {:a {:desc "Apps"
                 :keys {:e {:desc "Emacs" :action "echo emacs"}
+                       :b {:desc "Brave" :action "echo brave"}
+                       [:shift :b] {:desc "Brave Private" :action "echo brave-private"}
+                       [:ctrl :shift :x] {:desc "Special" :action "echo special"}
                        :u {:desc "Utils"
                            :keys {:d {:desc "ncdu" :action "echo ncdu"}
                                   :n {:desc "Network"
@@ -250,6 +253,36 @@
     (assert= 0 (:mod-state s) "mods")
     (assert= 0 (:buffered-mods s) "buffered")
     (assert= 0 (:consumed-mods s) "consumed")))
+
+;; ---- Modal modifier+key tests ----
+
+(deftest "modal: plain :b triggers Brave"
+  (reset-state!)
+  (combo SUPER SPACE) (tap KEY_A) ;; enter Apps submenu
+  (clear!)
+  (tap KEY_B)                     ;; plain b -> "echo brave"
+  (assert= :idle (:mode @core/fsm-state) "back to idle"))
+
+(deftest "modal: Shift+B triggers Brave Private"
+  (reset-state!)
+  (combo SUPER SPACE) (tap KEY_A) ;; enter Apps submenu
+  (clear!)
+  (press SHIFT) (tap KEY_B) (release SHIFT)
+  (assert= :idle (:mode @core/fsm-state) "back to idle"))
+
+(deftest "modal: Ctrl+Shift+X triggers Special"
+  (reset-state!)
+  (combo SUPER SPACE) (tap KEY_A) ;; enter Apps submenu
+  (clear!)
+  (press CTRL) (press SHIFT) (tap KEY_X) (release SHIFT) (release CTRL)
+  (assert= :idle (:mode @core/fsm-state) "back to idle"))
+
+(deftest "modal: unmodified key ignores modifier entries"
+  (reset-state!)
+  (combo SUPER SPACE) (tap KEY_A)
+  (clear!)
+  (tap KEY_X) ;; plain x, no [:shift :x] or [:ctrl :shift :x] match - swallowed
+  (assert= :modal (:mode @core/fsm-state) "still in modal"))
 
 ;; ================================================================
 (println)
