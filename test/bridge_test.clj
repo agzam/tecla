@@ -135,7 +135,8 @@
 
 (defn start-bridge [sock-path]
   (let [proc (p/process {:out :inherit :in :inherit :err :inherit}
-                         bridge-bin "--socket" sock-path "--timeout" "120")]
+                         bridge-bin "--allow-virtual"
+                         "--socket" sock-path "--timeout" "120")]
     (Thread/sleep 500) proc))
 
 (defn start-monitor [devnode]
