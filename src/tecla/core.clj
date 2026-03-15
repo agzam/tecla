@@ -1,9 +1,10 @@
 (ns tecla.core
-  "Entry point. All keyboard logic lives here - the bridge is just I/O."
+  "Entry point. Unified keymap - all keyboard logic here."
   (:require [tecla.bridge :as bridge]
             [tecla.fsm :as fsm]
             [tecla.keys :as keys]
             [tecla.hud :as hud]
+            [tecla.wm :as wm]
             [babashka.nrepl.server :as nrepl]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -13,19 +14,17 @@
 (defonce nrepl-server (atom nil))
 
 ;; ----------------------------------------------------------------
-;; Keyboard state - all in Clojure, debuggable from REPL
+;; Keyboard state
 ;; ----------------------------------------------------------------
 
 (defonce kbd-state
-  (atom {:mod-state 0          ;; physical modifier bitmask
-         :buffered-mods 0      ;; mods pressed but not yet emitted
-         :consumed-mods 0      ;; mods consumed by remap (don't emit)
-         :active-remaps {}     ;; key-code -> remap entry (for release handling)
-         :remap-mods 0}))      ;; bitmask of all mods used in any remap
+  (atom {:mod-state 0
+         :buffered-mods 0
+         :consumed-mods 0
+         :active-sims {}      ;; code -> {:from-mods :to-combo} for key release
+         :buffer-mods 0}))    ;; bitmask of mods to buffer (from keymap scan)
 
-(defn- update-mod-state
-  "Track physical modifier state from raw key event."
-  [state code value]
+(defn- update-mod-state [state code value]
   (let [bit (keys/code->mod-bit code)]
     (if (zero? bit)
       state
@@ -34,107 +33,113 @@
                 #(bit-or % bit)
                 #(bit-and % (bit-not bit)))))))
 
-(defn compute-remap-mods
-  "Compute bitmask of all modifiers used in any remap rule."
-  [config]
-  (let [trigger-mod (keys/mods->bits (get-in config [:trigger :mods] []))]
-    (reduce (fn [acc [from _]]
-              (let [mods (if (vector? from) (butlast from) [])]
-                (bit-or acc (keys/mods->bits mods))))
-            trigger-mod
-            (:remaps config))))
+(defn compute-buffer-mods
+  "Scan keymap for modifier bits that need buffering."
+  [keymap]
+  (reduce (fn [acc [combo _]]
+            (if (vector? combo)
+              (let [mods (butlast combo)]
+                (bit-or acc (keys/mods->bits mods)))
+              acc))
+          0
+          keymap))
 
 ;; ----------------------------------------------------------------
-;; Remap logic
+;; Keymap lookup
 ;; ----------------------------------------------------------------
 
-(defn- find-remap
-  "Find a matching remap for the given modifier state and key code."
-  [config mod-state code]
+(defn- find-binding
+  "Look up a key combo in a keymap. Returns the value or nil."
+  [keymap mod-state code]
   (let [key-kw (keys/code->key code)]
-    (some (fn [[from to]]
-            (let [from-mods (if (vector? from) (butlast from) [])
-                  from-key (if (vector? from) (last from) from)
-                  from-bits (keys/mods->bits from-mods)]
-              (when (and (= from-key key-kw) (= from-bits mod-state))
-                {:from-mods from-bits
-                 :from-key code
-                 :to-mods (if (vector? to) (butlast to) [])
-                 :to-key (if (vector? to) (last to) to)})))
-          (:remaps config))))
+    (when key-kw
+      (some (fn [[combo value]]
+              (when (vector? combo)
+                (let [mods (butlast combo)
+                      key (last combo)
+                      bits (keys/mods->bits mods)]
+                  (when (and (= key key-kw) (= bits mod-state))
+                    value))))
+            keymap))))
 
-(defn- emit-mods! [mods value]
-  (doseq [m (if (sequential? mods) mods [mods])]
-    (let [kw (keyword (str "left-" (name m)))]
-      (when-let [code (keys/key->code kw)]
-        (bridge/emit! code value)))))
+(defn- effective-keymap
+  "Get the effective keymap: app-local merged on top of global."
+  [config]
+  ;; TODO: merge app-local-keymap when compositor adapter is ready
+  (:global-keymap config))
 
-(defn- handle-remap-press!
-  "Handle a key press that matches a remap. Returns true if handled."
-  [state config code]
-  (let [mod-state (:mod-state @state)
-        remap (find-remap config mod-state code)]
-    (when remap
-      ;; Emit target modifier press + key press
-      (emit-mods! (:to-mods remap) 1)
-      (bridge/emit! (keys/key->code (:to-key remap)) 1)
-      ;; Track consumed modifiers and active remap
-      (swap! state (fn [s]
-                     (-> s
-                         (update :consumed-mods bit-or (:from-mods remap))
-                         (update :buffered-mods #(bit-and % (bit-not (:from-mods remap))))
-                         (assoc-in [:active-remaps code] remap))))
-      true)))
+;; ----------------------------------------------------------------
+;; Value dispatch - the "smart" part
+;; ----------------------------------------------------------------
 
-(defn- handle-remap-release!
-  "Handle key release for an active remap. Returns true if handled."
+(defn- simulate-keys!
+  "Simulate a key combo like [:ctrl :c] or [:ctrl :shift :tab]."
+  [combo]
+  (let [mods (butlast combo)
+        key (last combo)]
+    (doseq [m mods]
+      (when-let [code (keys/key->code (keyword (str "left-" (name m))))]
+        (bridge/emit! code 1)))
+    (when-let [code (keys/key->code key)]
+      (bridge/emit! code 1)
+      (bridge/emit! code 0))
+    (doseq [m (reverse mods)]
+      (when-let [code (keys/key->code (keyword (str "left-" (name m))))]
+        (bridge/emit! code 0)))))
+
+(defn- dispatch-form!
+  "Dispatch a list form like (wm/focus-left) or (my.actions/launch \"kitty\")."
+  [form]
+  (let [sym (first form)
+        args (rest form)]
+    (if-let [resolved (try (requiring-resolve sym) (catch Exception _ nil))]
+      (future (apply resolved args))
+      (println "Cannot resolve:" sym))))
+
+(defn dispatch-value!
+  "Dispatch an action value based on its type."
+  [value]
+  (cond
+    (vector? value)  (simulate-keys! value)
+    (string? value)  (future (sh "sh" "-c" value))
+    (list? value)    (dispatch-form! value)
+    (fn? value)      (future (value))
+    :else            (println "Unknown action:" (pr-str value))))
+
+;; ----------------------------------------------------------------
+;; Key simulation tracking (for proper release handling)
+;; ----------------------------------------------------------------
+
+(defn- handle-sim-press!
+  "Handle a keymap match that simulates keys. Track for release."
+  [state mod-state code combo]
+  ;; Consume source modifiers, emit target combo
+  (swap! state (fn [s]
+                 (-> s
+                     (update :consumed-mods bit-or (bit-and mod-state (:buffered-mods s)))
+                     (update :buffered-mods #(bit-and % (bit-not mod-state)))
+                     (assoc-in [:active-sims code]
+                               {:from-mods mod-state :to-combo combo}))))
+  (simulate-keys! combo))
+
+(defn- handle-sim-release!
+  "Handle key release for an active simulation. Returns true if handled."
   [state code]
-  (when-let [remap (get-in @state [:active-remaps code])]
-    ;; Release target key + target modifiers
-    (bridge/emit! (keys/key->code (:to-key remap)) 0)
-    (emit-mods! (:to-mods remap) 0)
-    (swap! state update :active-remaps dissoc code)
+  (when-let [{:keys [to-combo]} (get-in @state [:active-sims code])]
+    ;; Release target key + mods
+    (let [mods (butlast to-combo)
+          key (last to-combo)]
+      (when-let [kc (keys/key->code key)]
+        (bridge/emit! kc 0))
+      (doseq [m (reverse mods)]
+        (when-let [kc (keys/key->code (keyword (str "left-" (name m))))]
+          (bridge/emit! kc 0))))
+    (swap! state update :active-sims dissoc code)
     true))
 
-(defn- flush-buffered-mods!
-  "Forward any buffered modifiers to uinput (no remap matched)."
-  [state]
-  (let [buf (:buffered-mods @state)]
-    (when-not (zero? buf)
-      (doseq [bit [1 2 4 8]]
-        (when-not (zero? (bit-and buf bit))
-          (bridge/emit! (keys/mod-bit->code bit) 1)))
-      (swap! state assoc :buffered-mods 0))))
-
 ;; ----------------------------------------------------------------
-;; Action / effect execution
+;; Effect handling
 ;; ----------------------------------------------------------------
-
-(defmulti execute-action
-  (fn [action] (cond (string? action) :shell
-                     (fn? action)     :fn
-                     (keyword? action) :keyword
-                     (vector? action) :vector
-                     :else :unknown)))
-
-(defmethod execute-action :shell [cmd]
-  (future (sh "sh" "-c" cmd)))
-
-(defmethod execute-action :fn [f] (future (f)))
-
-(defmethod execute-action :vector [v]
-  (let [[type mods key] v]
-    (when (= type :key)
-      (emit-mods! mods 1)
-      (bridge/emit! (keys/key->code key) 1)
-      (bridge/emit! (keys/key->code key) 0)
-      (emit-mods! mods 0))))
-
-(defmethod execute-action :keyword [k]
-  (println "Action registry not yet implemented:" k))
-
-(defmethod execute-action :unknown [a]
-  (println "Unknown action:" (pr-str a)))
 
 (defn handle-effect [effect]
   (when effect
@@ -146,36 +151,45 @@
                       (doseq [bit [1 2 4 8]]
                         (when (pos? (bit-and ms bit))
                           (bridge/emit! (keys/mod-bit->code bit) 1)))))
-      :action (execute-action (:action effect))
-      :action-and-exit (do (execute-action (:action effect))
+      :action (dispatch-value! (:action effect))
+      :action-and-exit (do (dispatch-value! (:action effect))
                            (handle-effect {:type :exit-modal}))
       nil)))
+
+;; ----------------------------------------------------------------
+;; Flush buffered modifiers
+;; ----------------------------------------------------------------
+
+(defn- flush-buffered-mods! [state]
+  (let [buf (:buffered-mods @state)]
+    (when-not (zero? buf)
+      (doseq [bit [1 2 4 8]]
+        (when-not (zero? (bit-and buf bit))
+          (bridge/emit! (keys/mod-bit->code bit) 1)))
+      (swap! state assoc :buffered-mods 0))))
 
 ;; ----------------------------------------------------------------
 ;; Main key event handler
 ;; ----------------------------------------------------------------
 
 (defn on-key-event
-  "Called for every raw key event from the bridge."
   [code value]
   (let [state kbd-state
         config (:config @fsm-state)
         is-mod (keys/modifier-code? code)
-        remap-mods (:remap-mods @state)
+        buffer-mods (:buffer-mods @state)
         press? (= value 1)
         release? (= value 0)]
 
-    ;; Update physical modifier tracking
+    ;; Track physical modifier state
     (swap! state update-mod-state code value)
 
     (cond
       ;; === MODAL MODE ===
       (= :modal (:mode @fsm-state))
       (cond
-        ;; Modifiers pass through in modal
         is-mod (bridge/emit! code value)
 
-        ;; Key press: feed to FSM
         press?
         (let [key-kw (keys/code->key code)
               new-fsm (swap! fsm-state fsm/process-event
@@ -183,15 +197,14 @@
           (handle-effect (:effect new-fsm))
           (swap! fsm-state assoc :effect nil))
 
-        ;; Key release in modal: swallow
         :else nil)
 
       ;; === PASSTHROUGH MODE ===
 
-      ;; Modifier press: buffer if remap-eligible
+      ;; Modifier press: buffer if it appears in any keymap combo
       (and is-mod press?)
       (let [bit (keys/code->mod-bit code)]
-        (if (pos? (bit-and bit remap-mods))
+        (if (pos? (bit-and bit buffer-mods))
           (swap! state update :buffered-mods bit-or bit)
           (do (flush-buffered-mods! state)
               (bridge/emit! code value))))
@@ -200,50 +213,57 @@
       (and is-mod release?)
       (let [bit (keys/code->mod-bit code)]
         (cond
-          ;; Consumed by remap: drop silently
           (pos? (bit-and bit (:consumed-mods @state)))
           (swap! state update :consumed-mods #(bit-and % (bit-not bit)))
 
-          ;; Buffered but unused: emit as tap
           (pos? (bit-and bit (:buffered-mods @state)))
-          (do (bridge/emit! code 1)
-              (bridge/emit! code 0)
+          (do (bridge/emit! code 1) (bridge/emit! code 0)
               (swap! state update :buffered-mods #(bit-and % (bit-not bit))))
 
-          ;; Normal release
           :else (bridge/emit! code value)))
 
       ;; Non-modifier key press
       press?
       (let [mod-state (:mod-state @state)
-            trigger-mods (keys/mods->bits (get-in config [:trigger :mods] []))
-            trigger-key (keys/key->code (get-in config [:trigger :key]))]
+            keymap (effective-keymap config)
+            binding (find-binding keymap mod-state code)]
         (cond
-          ;; Trigger match
-          (and (= code trigger-key) (= mod-state trigger-mods))
+          ;; No match -> passthrough
+          (nil? binding)
+          (do (flush-buffered-mods! state)
+              (bridge/emit! code value))
+
+          ;; Vector -> simulate keys (remap)
+          (vector? binding)
+          (handle-sim-press! state mod-state code binding)
+
+          ;; Map with :keys -> enter modal
+          (and (map? binding) (:keys binding))
           (do (swap! state (fn [s]
                              (-> s
                                  (update :consumed-mods bit-or
-                                         (bit-and trigger-mods (:buffered-mods s)))
+                                         (bit-and mod-state (:buffered-mods s)))
                                  (update :buffered-mods
-                                         #(bit-and % (bit-not trigger-mods))))))
-              (let [new-fsm (swap! fsm-state fsm/process-event {:type :trigger})]
+                                         #(bit-and % (bit-not mod-state))))))
+              (let [new-fsm (swap! fsm-state fsm/process-event
+                                   {:type :enter-modal :entry binding})]
                 (handle-effect (:effect new-fsm))
                 (swap! fsm-state assoc :effect nil)))
 
-          ;; Remap match
-          (handle-remap-press! state config code)
-          nil ;; already handled
-
-          ;; No match: flush buffered mods, pass through
+          ;; String, list, fn -> execute directly
           :else
-          (do (flush-buffered-mods! state)
-              (bridge/emit! code value))))
+          (do (swap! state (fn [s]
+                             (-> s
+                                 (update :consumed-mods bit-or
+                                         (bit-and mod-state (:buffered-mods s)))
+                                 (update :buffered-mods
+                                         #(bit-and % (bit-not mod-state))))))
+              (dispatch-value! binding))))
 
       ;; Non-modifier key release
       release?
-      (if (handle-remap-release! state code)
-        nil ;; handled
+      (if (handle-sim-release! state code)
+        nil
         (bridge/emit! code value)))))
 
 ;; ----------------------------------------------------------------
@@ -261,7 +281,8 @@
     (throw (ex-info (str "Config not found: " path) {:path path}))))
 
 (defn apply-config! [config]
-  (swap! kbd-state assoc :remap-mods (compute-remap-mods config)))
+  (let [keymap (effective-keymap config)]
+    (swap! kbd-state assoc :buffer-mods (compute-buffer-mods keymap))))
 
 (defn update-config! [f & args]
   (let [new-config (apply f (:config @fsm-state) args)]
@@ -284,18 +305,31 @@
 (defn start!
   [& {:keys [config-path socket-path nrepl-port]
       :or {nrepl-port 7890}}]
+  ;; Add user's src to classpath
+  (let [user-src (str (or (System/getenv "XDG_CONFIG_HOME")
+                          (str (System/getenv "HOME") "/.config"))
+                      "/tecla/src")]
+    (when (.isDirectory (io/file user-src))
+      (babashka.classpath/add-classpath user-src)
+      (println "User classpath:" user-src)))
+
   (let [config-path (or config-path (default-config-path))
         config (load-config config-path)
         socket-path (or socket-path bridge/default-socket-path)]
 
     (println "Config:" config-path)
+
+    ;; Detect or set compositor
+    (if-let [c (:compositor config)]
+      (wm/set-compositor! c)
+      (wm/detect-compositor!))
+
     (reset! fsm-state (fsm/init config))
     (apply-config! config)
 
     (bridge/start-bridge! {:socket-path socket-path})
     (bridge/connect! on-key-event :socket-path socket-path)
 
-    ;; HUD polls FSM state on its own thread - zero coupling with key pipeline
     (hud/start! fsm-state fsm/current-menu)
 
     (let [srv (try (nrepl/start-server! {:host "127.0.0.1" :port nrepl-port})

@@ -3,17 +3,17 @@
 
    State shape:
      {:mode       :idle | :modal
-      :menu-stack [keymap ...]   ;; stack of keymap levels
-      :config     {...}          ;; full tecla config
-      :effect     nil | effect}  ;; side effect to execute
+      :menu-stack [keymap ...]
+      :config     {...}
+      :effect     nil | effect}
 
    Keymap entries can be:
-     {:desc \"...\" :action ...}             ;; leaf - execute action
-     {:desc \"...\" :keys {...}}             ;; submenu
-     {:desc \"...\" :transient true :keys {}} ;; transient submenu
-     :previous                               ;; go back one level
-     :root                                   ;; go back to root
-     :exit                                   ;; exit modal entirely")
+     {:desc ... :action ...}           ;; leaf
+     {:desc ... :keys {...}}           ;; submenu
+     {:desc ... :transient true :keys {}} ;; transient submenu
+     :previous                         ;; go back one level
+     :root                             ;; jump to root of current modal
+     :exit                             ;; exit modal entirely")
 
 (defn init [config]
   {:mode :idle
@@ -22,10 +22,9 @@
    :effect nil})
 
 (defn current-menu
-  [{:keys [menu-stack config]}]
-  (if (seq menu-stack)
-    (peek menu-stack)
-    (:root config)))
+  [{:keys [menu-stack]}]
+  (when (seq menu-stack)
+    (peek menu-stack)))
 
 (defn- lookup-key [state key]
   (when-let [menu (current-menu state)]
@@ -35,25 +34,24 @@
 ;; Transitions
 ;; ----------------------------------------------------------------
 
-(defn trigger [state]
+(defn enter-modal
+  "Enter modal with the given submenu entry."
+  [state entry]
   (if (= (:mode state) :idle)
     (-> state
         (assoc :mode :modal
-               :menu-stack [(get-in state [:config :root])]
+               :menu-stack [(with-meta (:keys entry)
+                                       {:desc (:desc entry)
+                                        :transient (:transient entry)})]
                :effect {:type :enter-modal}))
     state))
 
-(defn- exit-modal
-  "Exit modal entirely - back to idle."
-  [state]
+(defn- exit-modal [state]
   (-> state
-      (assoc :mode :idle
-             :menu-stack []
+      (assoc :mode :idle :menu-stack []
              :effect {:type :exit-modal})))
 
-(defn- go-previous
-  "Pop one menu level, or exit if at root."
-  [state]
+(defn- go-previous [state]
   (let [stack (:menu-stack state)]
     (if (< (count stack) 2)
       (exit-modal state)
@@ -61,30 +59,27 @@
           (update :menu-stack pop)
           (assoc :effect nil)))))
 
-(defn- go-root
-  "Jump back to root menu."
-  [state]
-  (-> state
-      (assoc :menu-stack [(get-in state [:config :root])])
-      (assoc :effect nil)))
+(defn- go-root [state]
+  (let [stack (:menu-stack state)]
+    (if (seq stack)
+      (-> state
+          (assoc :menu-stack [(first stack)])
+          (assoc :effect nil))
+      state)))
 
 (defn handle-key
-  "Handle a key event in modal mode. Only processes key-down (press? = true)."
   [state key press?]
   (if (or (not= (:mode state) :modal) (not press?))
     (assoc state :effect nil)
     (let [entry (lookup-key state key)]
       (cond
-        ;; No binding - swallow
         (nil? entry)
         (assoc state :effect nil)
 
-        ;; Navigation keywords
         (= entry :previous) (go-previous state)
         (= entry :root)     (go-root state)
         (= entry :exit)     (exit-modal state)
 
-        ;; Submenu - push onto stack
         (:keys entry)
         (-> state
             (update :menu-stack conj
@@ -93,7 +88,6 @@
                                 :transient (:transient entry)}))
             (assoc :effect nil))
 
-        ;; Action leaf
         (:action entry)
         (let [transient? (or (:transient entry)
                              (some #(:transient (meta %)) (:menu-stack state)))]
@@ -109,10 +103,9 @@
 
 (defn process-event [state event]
   (case (:type event)
-    :trigger (trigger state)
-    :key     (let [k (:key event)]
-               ;; Escape always exits all modals (use :previous for back)
-               (if (= :esc k)
-                 (exit-modal state)
-                 (handle-key state k (:press? event))))
+    :enter-modal (enter-modal state (:entry event))
+    :key (let [k (:key event)]
+           (if (= :esc k)
+             (exit-modal state)
+             (handle-key state k (:press? event))))
     (assoc state :effect nil)))

@@ -1,10 +1,8 @@
-{;; Key combo that opens the root modal
- :trigger {:mods [:super] :key :space}
+{;; :compositor :hyprland  ;; auto-detected if not set
 
- ;; Always-active remaps: [from] -> [to]
- ;; Each side is [modifier... key]
- :remaps
- {[:super :c] [:ctrl :c]
+ :global-keymap
+ {;; --- Remaps (Mac-like) ---
+  [:super :c] [:ctrl :c]
   [:super :v] [:ctrl :v]
   [:super :a] [:ctrl :a]
   [:super :z] [:ctrl :z]
@@ -12,21 +10,43 @@
   [:super :s] [:ctrl :s]
   [:super :w] [:ctrl :w]
   [:super :t] [:ctrl :t]
-  [:super :f] [:ctrl :f]}
+  [:super :f] [:ctrl :f]
 
- ;; Root modal keymap
- :root
- {:a {:desc "Apps"
-      :keys {:e {:desc "Emacs"    :action "emacsclient -c"}
-             :b {:desc "Browser"  :action "brave"}
-             :t {:desc "Terminal" :action "kitty"}}}
+  ;; --- Modal ---
+  [:super :space]
+  {:desc "Main"
+   :keys
+   {:a {:desc "Apps"
+        :keys {:e {:desc "Emacs"
+                   :action (wm/focus-or-launch "Emacs" "emacs")}
+               :b {:desc "Brave"
+                   :action (wm/focus-or-launch "brave-browser"
+                             "brave --enable-features=UseOzonePlatform")}
+               :p {:desc "Brave Private"
+                   :action (wm/focus-or-launch "initialTitle:New Private Tab.*"
+                             "brave --enable-features=UseOzonePlatform --incognito")}
+               :s {:desc "Slack"
+                   :action (wm/focus-or-launch "Slack")}
+               :q {:desc "qBittorrent"
+                   :action (wm/focus-or-launch "org.qbittorrent.qBittorrent" "qbittorrent")}}}
 
-  :w {:desc "Windows"
-      :keys {:h {:desc "Left"  :action "hyprctl dispatch movefocus l"}
-             :l {:desc "Right" :action "hyprctl dispatch movefocus r"}
-             :j {:desc "Down"  :action "hyprctl dispatch movefocus d"}
-             :k {:desc "Up"    :action "hyprctl dispatch movefocus u"}}}
+    :w {:desc "Windows"
+        :keys {:h {:desc "Left"  :action (wm/focus-left)}
+               :l {:desc "Right" :action (wm/focus-right)}
+               :j {:desc "Down"  :action (wm/focus-down)}
+               :k {:desc "Up"    :action (wm/focus-up)}
+               :m {:desc "Maximize"   :action (wm/maximize)}
+               :c {:desc "Close"      :action (wm/close-window)}
+               :r {:desc "Resize" :transient true
+                   :keys {:h {:desc "Shrink W" :action (wm/resize-active -20 0)}
+                          :l {:desc "Grow W"   :action (wm/resize-active 20 0)}
+                          :j {:desc "Grow H"   :action (wm/resize-active 0 20)}
+                          :k {:desc "Shrink H" :action (wm/resize-active 0 -20)}}}}}
 
-  :b {:desc "Buffers/Tabs"
-      :keys {:n {:desc "Next" :action [:key [:ctrl] :tab]}
-             :p {:desc "Prev" :action [:key [:ctrl :shift] :tab]}}}}}
+    :m {:desc "Media"
+        :keys {:k {:desc "Vol Up"   :action "pactl set-sink-volume @DEFAULT_SINK@ +5%"}
+               :j {:desc "Vol Down" :action "pactl set-sink-volume @DEFAULT_SINK@ -5%"}
+               :m {:desc "Mute"     :action "pactl set-sink-mute @DEFAULT_SINK@ toggle"}
+               :space {:desc "Play/Pause" :action "playerctl play-pause"}
+               :l {:desc "Next"     :action "playerctl next"}
+               :h {:desc "Prev"     :action "playerctl previous"}}}}}}}
