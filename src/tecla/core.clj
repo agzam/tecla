@@ -12,6 +12,7 @@
 
 (defonce fsm-state (atom nil))
 (defonce nrepl-server (atom nil))
+(defonce config-watcher (atom nil))
 
 ;; ----------------------------------------------------------------
 ;; Keyboard state
@@ -343,10 +344,69 @@
     (send-keymap-bindings! (effective-keymap new-config))))
 
 ;; ----------------------------------------------------------------
+;; Config file watcher
+;; ----------------------------------------------------------------
+
+(defn- dir-fingerprint
+  "Max lastModified across all files in dir. Fast, no allocations on
+   the hot path - just stat calls in a daemon thread."
+  [^java.io.File dir]
+  (reduce (fn [mx ^java.io.File f]
+            (if (.isFile f) (max mx (.lastModified f)) mx))
+          0 (.listFiles dir)))
+
+(defn reload-config!
+  "Re-read config from disk and apply without restarting the bridge."
+  [path]
+  (let [config (load-config path)
+        keymap (effective-keymap config)]
+    (when-let [c (:compositor config)]
+      (wm/set-compositor! c))
+    ;; Exit modal if active so the new keymap takes effect cleanly
+    (when (= :modal (:mode @fsm-state))
+      (let [new-fsm (swap! fsm-state fsm/process-event
+                           {:type :key :key :esc :press? true})]
+        (handle-effect (:effect new-fsm))
+        (swap! fsm-state assoc :effect nil)))
+    (swap! fsm-state assoc :config config)
+    (apply-config! config)
+    (send-keymap-bindings! keymap)
+    (println "Config reloaded:" path)))
+
+(defn- start-config-watcher!
+  "Poll the config directory every 2s. When any file changes, reload.
+   Runs in a daemon thread - never touches the key processing path."
+  [config-path]
+  (let [dir (.getParentFile (io/file config-path))
+        fp  (atom (dir-fingerprint dir))]
+    (reset! config-watcher true)
+    (doto (Thread.
+            (fn []
+              (while @config-watcher
+                (Thread/sleep 2000)
+                (try
+                  (let [new-fp (dir-fingerprint dir)]
+                    (when (not= new-fp @fp)
+                      (reset! fp new-fp)
+                      ;; Brief pause for editors that do write-rename
+                      (Thread/sleep 200)
+                      (reload-config! config-path)))
+                  (catch Exception e
+                    (println "Config watcher error:" (.getMessage e))))))
+            "tecla-config-watcher")
+      (.setDaemon true)
+      (.start))
+    (println "Watching" (.getPath dir) "for changes")))
+
+(defn- stop-config-watcher! []
+  (reset! config-watcher nil))
+
+;; ----------------------------------------------------------------
 ;; Entry point
 ;; ----------------------------------------------------------------
 
 (defn stop! []
+  (stop-config-watcher!)
   (hud/stop!)
   (hud/kill!)
   (when @nrepl-server
@@ -392,6 +452,8 @@
                                            :port (inc nrepl-port)})))]
       (reset! nrepl-server srv)
       (println "nREPL started"))
+
+    (start-config-watcher! config-path)
 
     (println "tecla ready.")
 
