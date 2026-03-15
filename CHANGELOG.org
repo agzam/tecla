@@ -1,0 +1,31 @@
+#+title: Changelog
+
+* Unreleased
+
+** Bridge
+- Replace blocking 3-second device rescan with inotify on /dev/input
+- Disable kernel autorepeat on virtual keyboard (EVIOCSREP)
+- Safety releases for dropped events - prevents stuck keys
+- Key state de-duplication across multiple physical keyboards
+- Filter virtual devices by phys path (catches ydotool, espanso, etc.)
+- Reduced send_to_client poll timeout (50ms -> 5ms)
+
+** Keyboard processing
+- Modal menus support modifier+key entries (e.g., =[:shift :b]=, =[:ctrl :shift :x]=)
+- Modifiers not emitted during modal mode - only used for menu matching
+- Blocking I/O and queue-based event processing in Babashka reader
+- Error handling around key callbacks with safety releases
+
+** Window management
+- =wm/focus-or-launch= accepts map ={:class ... :command ...}= (positional args still work)
+- Hyprland: proper JSON parsing via cheshire (fixes focus-or-launch not finding windows)
+- GNOME: updated to same map signature
+
+** HUD
+- Grid layout for aligned key/description columns
+- Vector keys render as =shift+b= in the overlay
+
+** Config
+- Auto-reload on file changes (polls =~/.config/tecla/= every 2s)
+- Auto-copy =config.example.edn= on first run
+- Example config updated to map-based =focus-or-launch= syntax
