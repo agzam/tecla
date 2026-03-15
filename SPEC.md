@@ -220,33 +220,29 @@ typing difficult.
 
 **Analysis (from studying keyd, kanata, evremap):**
 
-The bridge was globally dropping all autorepeat events (value=2) from the
-physical keyboard, and also dropping non-key events (SYN_REPORT) when a client
-was connected. This meant the virtual keyboard output differed from the physical
-keyboard in two ways:
+Both keyd and kanata do all event processing in a single process with no IPC.
+keyd enables EV_REP on its virtual keyboard; kanata (like Tecla) disables it
+and drops value=2, relying on the compositor for repeat. Both work fine - the
+common factor is that the event loop is never blocked.
 
-1. No autorepeat events for keys on the direct passthrough path (fp_emit).
-   These keys never touch the socket - they should be a faithful proxy of the
-   physical keyboard, but they were missing value=2 events.
+Tecla's bridge had a 3-second periodic rescan (`grab_keyboards()`) that
+iterated all 64 /dev/input/event* paths with open/stat/grab syscalls. This
+blocked the main event loop, causing kernel events to pile up in evdev buffers
+and burst-deliver when the scan completed. This is the likely cause of the
+intermittent "dozens of characters from a single tap" issue.
 
-2. Missing SYN_REPORT framing. The physical keyboard batches events between
-   SYN_REPORT markers; the bridge was dropping these and generating synthetic
-   ones, changing the event timing characteristics.
-
-Both keyd and kanata handle this by ensuring unmapped/passthrough keys go
-through with minimal transformation. kanata uses `write_raw` which preserves
-original event batching (buffers events, flushes on SYN_REPORT).
+Forwarding value=2 events for passthrough keys was tried but made the burst
+problem worse - piled-up autorepeat events from the physical keyboard's kernel
+timer would all be forwarded during the burst.
 
 **Current approach:**
 
-- Forward value=2 events for keys on the direct passthrough path (fp_emit),
-  so the virtual keyboard replicates the physical keyboard's repeat timing.
-- Drop value=2 for keys routed through the Babashka client, since the
-  compositor handles repeat for those.
-- Pass through non-key events (SYN_REPORT) from the physical keyboard even
-  when a client is connected, preserving event framing.
-- EV_REP remains disabled on the virtual keyboard to avoid double-repeat
-  (kernel repeat + forwarded repeat).
+- Drop value=2 events (autorepeat) from all physical keyboards. The
+  compositor handles repeat for the virtual keyboard in userspace.
+- EV_REP is disabled on the virtual keyboard to avoid double-repeat.
+- EVIOCSREP ioctl zeroes repeat params as belt-and-suspenders.
+- Device hot-plug uses inotify on /dev/input instead of blocking periodic
+  rescan. The main event loop is never stalled by device enumeration.
 
 ## Not yet implemented
 

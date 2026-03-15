@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/inotify.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -47,6 +48,7 @@ static int device_count = 0;
 static struct libevdev_uinput *uidev = NULL;
 static int listen_fd = -1;
 static int client_fd = -1;
+static int inotify_fd = -1;
 static char socket_path[108] = "";
 
 /* ---- Key state de-duplication across multiple devices ---- */
@@ -64,6 +66,7 @@ static char fp_sent[KEY_MAX + 1];      /* per-keycode: was last press sent to cl
 static int fp_active = 0;             /* 1 = passthrough mode, 0 = intercept all */
 
 static void cleanup(void) {
+    if (inotify_fd >= 0) { close(inotify_fd); inotify_fd = -1; }
     if (client_fd >= 0) { close(client_fd); client_fd = -1; }
     if (listen_fd >= 0) { close(listen_fd); listen_fd = -1; }
     if (socket_path[0]) unlink(socket_path);
@@ -488,25 +491,21 @@ int main(int argc, char **argv) {
     if (listen_fd < 0) return 1;
     fprintf(stderr, "Socket: %s\nReady.\n", socket_path);
 
+    /* Watch /dev/input for new devices instead of polling every 3s.
+     * inotify wakes us only when a device actually appears, so the
+     * main event loop is never blocked by a rescan. */
+    inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (inotify_fd >= 0)
+        inotify_add_watch(inotify_fd, "/dev/input", IN_CREATE);
+
     time_t start = time(NULL);
-    time_t last_scan = time(NULL);
     struct input_event ev;
 
     while (running) {
         if (timeout_sec > 0 && (time(NULL) - start) >= timeout_sec) break;
 
-        /* Rescan for new keyboards every 3 seconds */
-        time_t now = time(NULL);
-        if (now - last_scan >= 3) {
-            int before = device_count;
-            grab_keyboards();
-            if (device_count > before)
-                fprintf(stderr, "Now %d keyboard(s)\n", device_count);
-            last_scan = now;
-        }
-
-        /* Build poll set: all keyboards + listen socket + client */
-        struct pollfd pfds[MAX_DEVICES + 2];
+        /* Build poll set: keyboards + listen + client + inotify */
+        struct pollfd pfds[MAX_DEVICES + 3];
         int nfds = 0;
 
         for (int i = 0; i < device_count; i++)
@@ -522,9 +521,27 @@ int main(int argc, char **argv) {
             pfds[nfds++] = (struct pollfd){ .fd = client_fd, .events = POLLIN };
         }
 
+        int inotify_idx = -1;
+        if (inotify_fd >= 0) {
+            inotify_idx = nfds;
+            pfds[nfds++] = (struct pollfd){ .fd = inotify_fd, .events = POLLIN };
+        }
+
         if (poll(pfds, nfds, 1000) < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+
+        /* New device appeared in /dev/input - drain inotify and rescan.
+         * Small delay lets udev finish setting up permissions. */
+        if (inotify_idx >= 0 && (pfds[inotify_idx].revents & POLLIN)) {
+            char ibuf[4096];
+            while (read(inotify_fd, ibuf, sizeof(ibuf)) > 0) {}
+            usleep(200000); /* 200ms for udev */
+            int before = device_count;
+            grab_keyboards();
+            if (device_count > before)
+                fprintf(stderr, "Now %d keyboard(s)\n", device_count);
         }
 
         /* Accept connection */
@@ -568,17 +585,11 @@ int main(int argc, char **argv) {
                 if (rc == LIBEVDEV_READ_STATUS_SYNC) {
                     while (rc == LIBEVDEV_READ_STATUS_SYNC) {
                         if (ev.type != EV_KEY) {
-                            libevdev_uinput_write_event(
-                                uidev, ev.type, ev.code, ev.value);
-                        } else if (ev.value == 2) {
-                            /* Forward repeat for passthrough keys */
-                            if (client_fd < 0) {
+                            if (client_fd < 0)
                                 libevdev_uinput_write_event(
-                                    uidev, EV_KEY, ev.code, 2);
-                            } else if (fp_active && key_state[ev.code]
-                                       && !fp_sent[ev.code]) {
-                                fp_emit(ev.code, 2);
-                            }
+                                    uidev, ev.type, ev.code, ev.value);
+                        } else if (ev.value == 2) {
+                            /* drop autorepeat during sync */
                         } else if ((ev.value == 1 && key_state[ev.code]) ||
                                    (ev.value == 0 && !key_state[ev.code])) {
                             /* skip duplicate */
@@ -602,27 +613,15 @@ int main(int argc, char **argv) {
                 }
                 if (rc < 0) break;
                 if (ev.type != EV_KEY) {
-                    /* Pass through non-key events (incl. SYN_REPORT)
-                     * so the virtual keyboard preserves the physical
-                     * keyboard's event framing. */
-                    libevdev_uinput_write_event(
-                        uidev, ev.type, ev.code, ev.value);
-                    continue;
-                }
-                if (ev.value == 2) {
-                    /* Forward autorepeat for keys on the direct
-                     * passthrough path (never touched the client).
-                     * Drop it for keys routed through the client -
-                     * the compositor provides repeat for those. */
-                    if (client_fd < 0) {
+                    /* Non-key events: only pass through when no client
+                     * (client mode uses fp_emit/process_command which
+                     *  generate their own SYN_REPORT) */
+                    if (client_fd < 0)
                         libevdev_uinput_write_event(
-                            uidev, EV_KEY, ev.code, 2);
-                    } else if (fp_active && key_state[ev.code]
-                               && !fp_sent[ev.code]) {
-                        fp_emit(ev.code, 2);
-                    }
+                            uidev, ev.type, ev.code, ev.value);
                     continue;
                 }
+                if (ev.value == 2) continue; /* drop autorepeat */
 
                 /* De-duplicate: if multiple devices report the same
                  * physical key, only the first event gets through. */
