@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -29,8 +30,11 @@
 #include <linux/input.h>
 
 #define MAX_DEVICES 16
+#define VKBD_NAME "tecla-virtual-keyboard"
 
 static volatile int running = 1;
+static int debug = 0;
+static int allow_virtual = 0;   /* --allow-virtual: skip phys check (for tests) */
 static dev_t uinput_devnum = 0; /* our virtual device, skip during scan */
 
 static struct {
@@ -44,6 +48,20 @@ static struct libevdev_uinput *uidev = NULL;
 static int listen_fd = -1;
 static int client_fd = -1;
 static char socket_path[108] = "";
+
+/* ---- Key state de-duplication across multiple devices ---- */
+static char key_state[KEY_MAX + 1];   /* physical key state: 0=up, 1=down */
+
+/* ---- Fast-path passthrough state ---- */
+
+#define MAX_BINDINGS 256
+
+static struct { int mod_mask; int keycode; } fp_bindings[MAX_BINDINGS];
+static int fp_binding_count = 0;
+static int fp_intercept_mod_mask = 0;  /* union of mod bits from all bindings */
+static int fp_mod_state = 0;           /* current modifier state tracked here */
+static char fp_sent[KEY_MAX + 1];      /* per-keycode: was last press sent to client? */
+static int fp_active = 0;             /* 1 = passthrough mode, 0 = intercept all */
 
 static void cleanup(void) {
     if (client_fd >= 0) { close(client_fd); client_fd = -1; }
@@ -62,22 +80,149 @@ static void cleanup(void) {
 
 static void signal_handler(int sig) { (void)sig; running = 0; }
 
-static void send_to_client(const char *fmt, ...) {
-    if (client_fd < 0) return;
+static int send_to_client(const char *fmt, ...) {
+    if (client_fd < 0) return -1;
     char buf[512];
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (n > 0) write(client_fd, buf, n);
+    if (n <= 0) return -1;
+
+    int written = 0;
+    while (written < n) {
+        ssize_t w = write(client_fd, buf + written, n - written);
+        if (w > 0) {
+            written += w;
+        } else if (w < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Brief wait; keep short to avoid stalling the event loop */
+                struct pollfd pfd = { .fd = client_fd, .events = POLLOUT };
+                if (poll(&pfd, 1, 5) <= 0) {
+                    fprintf(stderr, "Client write timeout, dropping\n");
+                    return -1;
+                }
+                continue;
+            }
+            fprintf(stderr, "Client write error: %s\n", strerror(errno));
+            close(client_fd); client_fd = -1;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ---- Fast-path helpers ---- */
+
+static int fp_mod_bit(int code) {
+    switch (code) {
+        case KEY_LEFTCTRL:  case KEY_RIGHTCTRL:  return 1;
+        case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT: return 2;
+        case KEY_LEFTALT:   case KEY_RIGHTALT:   return 4;
+        case KEY_LEFTMETA:  case KEY_RIGHTMETA:  return 8;
+        default: return 0;
+    }
+}
+
+static int fp_has_nomods_binding(int keycode) {
+    for (int i = 0; i < fp_binding_count; i++)
+        if (fp_bindings[i].mod_mask == 0 && fp_bindings[i].keycode == keycode)
+            return 1;
+    return 0;
+}
+
+static void fp_emit(int code, int value) {
+    libevdev_uinput_write_event(uidev, EV_KEY, code, value);
+    libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+}
+
+static void fp_reset(void) {
+    fp_binding_count = 0;
+    fp_intercept_mod_mask = 0;
+    fp_mod_state = 0;
+    fp_active = 0;
+    memset(fp_sent, 0, sizeof(fp_sent));
+}
+
+static void fp_release_stuck(void) {
+    int any = 0;
+    for (int i = 0; i <= KEY_MAX; i++) {
+        if (fp_sent[i]) {
+            libevdev_uinput_write_event(uidev, EV_KEY, i, 0);
+            fp_sent[i] = 0;
+            any = 1;
+        }
+    }
+    if (any)
+        libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+}
+
+static void fp_route_key(int code, int value) {
+    if (!fp_active) {
+        /* Intercept-all mode: everything to client, but track state */
+        int rc = send_to_client("EV %d %d\n", code, value);
+        int mbit = fp_mod_bit(code);
+        if (mbit) {
+            if (value) fp_mod_state |= mbit;
+            else       fp_mod_state &= ~mbit;
+        }
+        if (value == 1) {
+            fp_sent[code] = 1;
+        } else if (value == 0) {
+            /* If send failed for a release, emit directly to prevent
+             * the key getting stuck in the pressed state. */
+            if (rc < 0) fp_emit(code, 0);
+            fp_sent[code] = 0;
+        }
+        return;
+    }
+
+    /* Fast-path passthrough mode */
+    int mbit = fp_mod_bit(code);
+    int to_client = 0;
+
+    if (value == 1) { /* press */
+        if (mbit) {
+            fp_mod_state |= mbit;
+            to_client = (mbit & fp_intercept_mod_mask) != 0;
+        } else {
+            to_client = ((fp_mod_state & fp_intercept_mod_mask) != 0)
+                     || fp_has_nomods_binding(code);
+        }
+        fp_sent[code] = to_client;
+        if (to_client) send_to_client("EV %d %d\n", code, value);
+        else           fp_emit(code, value);
+    } else { /* release */
+        if (mbit) fp_mod_state &= ~mbit;
+        if (fp_sent[code]) {
+            if (send_to_client("EV %d %d\n", code, value) < 0)
+                fp_emit(code, 0);   /* safety release */
+            fp_sent[code] = 0;
+        } else {
+            fp_emit(code, value);
+        }
+    }
 }
 
 /* ---- Device detection ---- */
 
 static int is_keyboard(struct libevdev *d) {
-    /* Skip virtual devices (uinput-created: Espanso, our own output, etc.) */
+    /* Skip any uinput / virtual device: they have no physical bus path.
+     * This catches our own device, Espanso, ydotool, etc. regardless
+     * of what bus type they claim (many copy BUS_USB from the source). */
+    if (!allow_virtual) {
+        const char *phys = libevdev_get_phys(d);
+        if (!phys || phys[0] == '\0')
+            return 0;
+    }
+
+    /* Belt-and-suspenders: also skip by name and declared bus type */
+    const char *name = libevdev_get_name(d);
+    if (name && strcmp(name, VKBD_NAME) == 0)
+        return 0;
     if (libevdev_get_id_bustype(d) == BUS_VIRTUAL)
         return 0;
+
     return libevdev_has_event_type(d, EV_KEY)
         && libevdev_has_event_code(d, EV_KEY, KEY_A)
         && libevdev_has_event_code(d, EV_KEY, KEY_Z)
@@ -206,6 +351,23 @@ static void process_command(char *line) {
             libevdev_uinput_write_event(uidev, EV_KEY, code, value);
             libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
         }
+    } else if (strncmp(line, "BIND ", 5) == 0) {
+        int mod_mask, keycode;
+        if (sscanf(line + 5, "%d %d", &mod_mask, &keycode) == 2
+            && fp_binding_count < MAX_BINDINGS) {
+            fp_bindings[fp_binding_count].mod_mask = mod_mask;
+            fp_bindings[fp_binding_count].keycode = keycode;
+            fp_binding_count++;
+            fp_intercept_mod_mask |= mod_mask;
+        }
+    } else if (strcmp(line, "PASSTHROUGH") == 0) {
+        fp_active = 1;
+    } else if (strcmp(line, "INTERCEPT") == 0) {
+        fp_active = 0;
+    } else if (strcmp(line, "CLEAR") == 0) {
+        fp_binding_count = 0;
+        fp_intercept_mod_mask = 0;
+        fp_active = 0;
     }
 }
 
@@ -216,6 +378,8 @@ static void process_client_data(void) {
         fprintf(stderr, "Client disconnected\n");
         close(client_fd); client_fd = -1;
         line_buf_len = 0;
+        fp_release_stuck();
+        fp_reset();
         return;
     }
     for (ssize_t i = 0; i < n; i++) {
@@ -236,6 +400,8 @@ int main(int argc, char **argv) {
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--list") == 0) { list_devices(); return 0; }
+        else if (strcmp(argv[i], "--debug") == 0) debug = 1;
+        else if (strcmp(argv[i], "--allow-virtual") == 0) allow_virtual = 1;
         else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
             timeout_sec = atoi(argv[++i]);
         else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
@@ -261,15 +427,51 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Grabbed %d keyboard(s)\n", device_count);
 
-    /* Create uinput from first device (copies its capabilities) */
+    /* Give the virtual keyboard a recognisable name so is_keyboard()
+     * can skip it during rescan.  libevdev_uinput_create_from_device
+     * copies the source device's input_id (including bus type), so
+     * the BUS_VIRTUAL check alone is not enough. */
+    const char *orig_name = libevdev_get_name(devices[0].dev);
+    libevdev_set_name(devices[0].dev, VKBD_NAME);
+
+    /* Disable autorepeat on virtual keyboard.
+     * On Wayland the compositor handles repeat via its own timer;
+     * kernel-level EV_REP on the virtual device just adds a second
+     * source of repeats that races with the round-trip latency. */
+    int had_rep = libevdev_has_event_type(devices[0].dev, EV_REP);
+    if (had_rep)
+        libevdev_disable_event_type(devices[0].dev, EV_REP);
+
     int rc = libevdev_uinput_create_from_device(
         devices[0].dev, LIBEVDEV_UINPUT_OPEN_MANAGED, &uidev);
+
+    /* Restore the grabbed device's original name and repeat cap */
+    if (orig_name)
+        libevdev_set_name(devices[0].dev, orig_name);
+    if (had_rep)
+        libevdev_enable_event_type(devices[0].dev, EV_REP);
+
     if (rc < 0) {
         fprintf(stderr, "uinput: %s\n", strerror(-rc));
         return 1;
     }
     const char *vdev = libevdev_uinput_get_devnode(uidev);
     fprintf(stderr, "Virtual: %s\n", vdev);
+
+    /* Belt-and-suspenders: force kernel autorepeat off on the virtual
+     * device.  Some kernel versions re-enable EV_REP for keyboard-like
+     * uinput devices even if we didn't request it.  Setting both
+     * delay and period to 0 disables the kernel repeat timer. */
+    { int vfd = open(vdev, O_WRONLY);
+      if (vfd >= 0) {
+          int rep[2] = {0, 0};
+          if (ioctl(vfd, EVIOCSREP, rep) < 0)
+              fprintf(stderr, "  EVIOCSREP: %s (non-fatal)\n", strerror(errno));
+          else
+              fprintf(stderr, "  Kernel autorepeat disabled on virtual kbd\n");
+          close(vfd);
+      }
+    }
 
     /* Remember our own device so we don't grab it during rescan */
     { struct stat st;
@@ -329,11 +531,15 @@ int main(int argc, char **argv) {
         if (pfds[listen_idx].revents & POLLIN) {
             int nfd = accept(listen_fd, NULL, NULL);
             if (nfd >= 0) {
-                if (client_fd >= 0) close(client_fd);
+                if (client_fd >= 0) {
+                    fp_release_stuck();
+                    close(client_fd);
+                }
                 client_fd = nfd;
                 fcntl(client_fd, F_SETFL,
                       fcntl(client_fd, F_GETFL) | O_NONBLOCK);
                 line_buf_len = 0;
+                fp_reset();
                 fprintf(stderr, "Client connected\n");
                 send_to_client("HELLO\n");
                 send_to_client("DEVNODE %s\n",
@@ -361,24 +567,69 @@ int main(int argc, char **argv) {
                                          LIBEVDEV_READ_FLAG_NORMAL, &ev);
                 if (rc == LIBEVDEV_READ_STATUS_SYNC) {
                     while (rc == LIBEVDEV_READ_STATUS_SYNC) {
-                        libevdev_uinput_write_event(
-                            uidev, ev.type, ev.code, ev.value);
+                        if (ev.type != EV_KEY) {
+                            if (client_fd < 0)
+                                libevdev_uinput_write_event(
+                                    uidev, ev.type, ev.code, ev.value);
+                        } else if (ev.value == 2) {
+                            /* skip autorepeat during sync */
+                        } else if ((ev.value == 1 && key_state[ev.code]) ||
+                                   (ev.value == 0 && !key_state[ev.code])) {
+                            /* skip duplicate */
+                        } else {
+                            key_state[ev.code] = (ev.value == 1);
+                            if (client_fd >= 0)
+                                fp_route_key(ev.code, ev.value);
+                            else
+                                libevdev_uinput_write_event(
+                                    uidev, ev.type, ev.code, ev.value);
+                        }
                         rc = libevdev_next_event(devices[d].dev,
                                                  LIBEVDEV_READ_FLAG_SYNC, &ev);
                     }
                     continue;
                 }
                 if (rc < 0 && rc != -EAGAIN) {
-                    /* Read error - device likely disconnected */
                     remove_device(d);
                     d--;
                     break;
                 }
                 if (rc < 0) break;
-                if (ev.type == EV_KEY && ev.value == 2) continue;
+                if (ev.type != EV_KEY) {
+                    /* Non-key events: only pass through when no client
+                     * (client mode uses fp_emit/process_command which
+                     *  generate their own SYN_REPORT) */
+                    if (client_fd < 0)
+                        libevdev_uinput_write_event(
+                            uidev, ev.type, ev.code, ev.value);
+                    continue;
+                }
+                if (ev.value == 2) continue; /* drop autorepeat */
 
-                if (ev.type == EV_KEY && client_fd >= 0) {
-                    send_to_client("EV %d %d\n", ev.code, ev.value);
+                /* De-duplicate: if multiple devices report the same
+                 * physical key, only the first event gets through. */
+                if (ev.value == 1 && key_state[ev.code]) {
+                    if (debug)
+                        fprintf(stderr, "  DUP dev%d key %d press\n",
+                                d, ev.code);
+                    continue;
+                }
+                if (ev.value == 0 && !key_state[ev.code]) {
+                    if (debug)
+                        fprintf(stderr, "  DUP dev%d key %d release\n",
+                                d, ev.code);
+                    continue;
+                }
+                key_state[ev.code] = (ev.value == 1);
+
+                if (debug)
+                    fprintf(stderr, "  dev%d: key %d %s -> %s\n",
+                            d, ev.code, ev.value ? "DN" : "UP",
+                            (client_fd < 0) ? "passthru" :
+                            (fp_active ? "fastpath" : "client"));
+
+                if (client_fd >= 0) {
+                    fp_route_key(ev.code, ev.value);
                 } else {
                     libevdev_uinput_write_event(
                         uidev, ev.type, ev.code, ev.value);

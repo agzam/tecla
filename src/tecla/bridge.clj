@@ -1,12 +1,13 @@
 (ns tecla.bridge
   "Socket client for tecla-bridge."
   (:require [tecla.keys :as keys]
-            [clojure.string :as str]
+            [clojure.string :as str]  ;; used in start-bridge!
             [babashka.process :as proc])
   (:import [java.net StandardProtocolFamily UnixDomainSocketAddress]
            [java.nio.channels SocketChannel]
            [java.nio ByteBuffer]
-           [java.nio.charset StandardCharsets]))
+           [java.nio.charset StandardCharsets]
+           [java.util.concurrent LinkedBlockingQueue TimeUnit]))
 
 (def default-socket-path
   (str (or (System/getenv "XDG_RUNTIME_DIR") "/tmp") "/tecla-bridge.sock"))
@@ -23,16 +24,9 @@
 ;; ----------------------------------------------------------------
 
 (defn- send-line [ch line]
-  (.write ch (ByteBuffer/wrap (.getBytes (str line "\n") StandardCharsets/UTF_8))))
-
-(defn- read-chunk [ch]
-  (let [buf (ByteBuffer/allocate 4096)
-        n (.read ch buf)]
-    (when (pos? n)
-      (.flip buf)
-      (let [bytes (byte-array n)]
-        (.get buf bytes)
-        (String. bytes StandardCharsets/UTF_8)))))
+  (let [buf (ByteBuffer/wrap (.getBytes (str line "\n") StandardCharsets/UTF_8))]
+    (while (.hasRemaining buf)
+      (.write ch buf))))
 
 ;; ----------------------------------------------------------------
 ;; Public API
@@ -41,7 +35,7 @@
 (defn emit! [code value]
   (let [code (if (keyword? code) (keys/key->code code) (int code))]
     (when (and code (:channel @state))
-      (send-line (:channel @state) (format "EM %d %d" code value)))))
+      (send-line (:channel @state) (str "EM " code " " value)))))
 
 (defn emit-key-tap! [code]
   (emit! code 1) (emit! code 0))
@@ -52,54 +46,125 @@
   (doseq [m (reverse mod-codes)] (emit! m 0)))
 
 ;; ----------------------------------------------------------------
+;; Fast-path control - tell bridge which keys to intercept
+;; ----------------------------------------------------------------
+
+(defn send-binding!
+  "Register a keymap binding with the bridge for fast-path routing."
+  [mod-mask keycode]
+  (when-let [ch (:channel @state)]
+    (send-line ch (str "BIND " mod-mask " " keycode))))
+
+(defn send-clear!
+  "Clear all registered bindings in the bridge."
+  []
+  (when-let [ch (:channel @state)]
+    (send-line ch "CLEAR")))
+
+(defn set-passthrough!
+  "Activate fast-path: only bound keys routed to client, rest pass through."
+  []
+  (when-let [ch (:channel @state)]
+    (send-line ch "PASSTHROUGH")))
+
+(defn set-intercept!
+  "Intercept all keys (for modal mode)."
+  []
+  (when-let [ch (:channel @state)]
+    (send-line ch "INTERCEPT")))
+
+;; ----------------------------------------------------------------
 ;; Reader thread
 ;; ----------------------------------------------------------------
 
-(defn- parse-line [line on-key]
-  (let [parts (str/split (str/trim line) #"\s+")]
-    (case (first parts)
-      "EV" (let [code (parse-long (nth parts 1))
-                 value (parse-long (nth parts 2))]
-             (when on-key (on-key code value)))
-      "HELLO" (println "Bridge connected")
-      "DEVNODE" (do (swap! state assoc :devnode (second parts))
-                    (println "Virtual device:" (second parts)))
-      nil)))
+(defn- parse-line
+  "Parse a bridge protocol line. EV events are placed on the queue
+   for the processor thread. HELLO/DEVNODE are handled inline."
+  [^String line ^LinkedBlockingQueue queue]
+  (cond
+    (.startsWith line "EV ")
+    (let [sp1 (.indexOf line (int \space) 3)]
+      (when (pos? sp1)
+        (let [code  (parse-long (.substring line 3 sp1))
+              value (parse-long (.substring line (inc sp1)))]
+          (when (and code value)
+            (.offer queue (long-array [code value]))))))
 
-(defn- reader-loop [ch on-key]
-  (let [partial (StringBuilder.)]
+    (.startsWith line "HELLO")
+    (println "Bridge connected")
+
+    (.startsWith line "DEVNODE ")
+    (let [path (.substring line 8)]
+      (swap! state assoc :devnode path)
+      (println "Virtual device:" path))))
+
+(defn- reader-loop
+  "Blocking reader. Reads from the channel and enqueues parsed EV events.
+   Exits when the channel is closed or :running becomes false."
+  [ch ^LinkedBlockingQueue queue]
+  (let [partial (StringBuilder.)
+        buf     (ByteBuffer/allocate 4096)]
     (while (:running @state)
       (try
-        (let [data (read-chunk ch)]
-          (if (nil? data)
-            (Thread/sleep 5)
+        (.clear buf)
+        (let [n (.read ch buf)]
+          (if (or (nil? n) (not (pos? n)))
+            (swap! state assoc :running false)
             (do
-              (.append partial data)
-              (let [s (.toString partial)
-                    lines (str/split s #"\n" -1)]
-                (.setLength partial 0)
-                (.append partial (last lines))
-                (doseq [line (butlast lines)]
-                  (when-not (str/blank? line)
-                    (parse-line line on-key)))))))
+              (.flip buf)
+              (let [bytes (byte-array n)]
+                (.get buf bytes)
+                (.append partial (String. bytes StandardCharsets/UTF_8)))
+              (loop []
+                (let [s   (.toString partial)
+                      idx (.indexOf s "\n")]
+                  (when-not (neg? idx)
+                    (let [line (.substring s 0 idx)]
+                      (.delete partial 0 (inc idx))
+                      (when (pos? (.length line))
+                        (parse-line line queue))
+                      (recur))))))))
         (catch Exception e
           (when (:running @state)
-            (println "Bridge reader error:" (.getMessage e))
-            (Thread/sleep 100)))))))
+            (println "Bridge reader error:" (.getMessage e))))))))
+
+(defn- event-processor
+  "Drains the event queue, calling on-key for each event.
+   Wraps the callback in error handling to prevent stuck keys."
+  [^LinkedBlockingQueue queue on-key]
+  (while (:running @state)
+    (try
+      (when-let [^longs ev (.poll queue 50 TimeUnit/MILLISECONDS)]
+        (let [code  (aget ev 0)
+              value (aget ev 1)]
+          (try
+            (on-key code value)
+            (catch Exception e
+              (println "Key handler error:" code value (.getMessage e))
+              ;; If release processing failed, emit safety release
+              ;; to prevent the key from being stuck down.
+              (when (zero? value)
+                (try (emit! code 0) (catch Exception _)))))))
+      (catch InterruptedException _
+        nil))))
 
 ;; ----------------------------------------------------------------
 ;; Connection
 ;; ----------------------------------------------------------------
 
 (defn connect!
-  "Connect to the bridge with retries."
+  "Connect to the bridge with retries.
+   Starts two daemon threads: a blocking reader that enqueues events
+   and a processor that drains the queue and calls on-key."
   [on-key & {:keys [socket-path retries]
              :or {socket-path default-socket-path retries 30}}]
   (loop [attempt 0]
     (let [ch (try
                (let [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
                  (.connect ch (UnixDomainSocketAddress/of socket-path))
-                 (.configureBlocking ch false)
+                 ;; Blocking mode: reader blocks on .read() until data
+                 ;; arrives. No spin-loop, no sleep, minimal latency.
+                 (.configureBlocking ch true)
                  ch)
                (catch Exception e
                  (when (>= attempt retries)
@@ -107,11 +172,14 @@
                                         (.getMessage e)) {})))
                  nil))]
       (if ch
-        (do
+        (let [queue (LinkedBlockingQueue. 512)]
           (swap! state assoc :channel ch :running true :on-key on-key)
-          (let [t (Thread. #(reader-loop ch on-key) "tecla-bridge-reader")]
-            (.setDaemon t true)
-            (.start t))
+          (doto (Thread. #(reader-loop ch queue) "tecla-bridge-reader")
+            (.setDaemon true)
+            (.start))
+          (doto (Thread. #(event-processor queue on-key) "tecla-event-processor")
+            (.setDaemon true)
+            (.start))
           (println "Connected to bridge"))
         (do (Thread/sleep 200) (recur (inc attempt)))))))
 

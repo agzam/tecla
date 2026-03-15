@@ -164,13 +164,14 @@
 (defn handle-effect [effect]
   (when effect
     (case (:type effect)
-      :enter-modal nil
+      :enter-modal (bridge/set-intercept!)
       :exit-modal (do
                     (swap! kbd-state assoc :buffered-mods 0 :consumed-mods 0)
                     (let [ms (:mod-state @kbd-state)]
                       (doseq [bit [1 2 4 8]]
                         (when (pos? (bit-and ms bit))
-                          (bridge/emit! (keys/mod-bit->code bit) 1)))))
+                          (bridge/emit! (keys/mod-bit->code bit) 1))))
+                    (bridge/set-passthrough!))
       :action (dispatch-value! (:action effect))
       :action-and-exit (do (dispatch-value! (:action effect))
                            (handle-effect {:type :exit-modal}))
@@ -300,6 +301,20 @@
     (edn/read-string (slurp path))
     (throw (ex-info (str "Config not found: " path) {:path path}))))
 
+(defn- send-keymap-bindings!
+  "Push keymap bindings to the bridge for fast-path passthrough."
+  [keymap]
+  (bridge/send-clear!)
+  (doseq [[combo _] keymap]
+    (when (vector? combo)
+      (let [mods    (butlast combo)
+            key     (last combo)
+            mod-bits (keys/mods->bits mods)
+            keycode  (keys/key->code key)]
+        (when keycode
+          (bridge/send-binding! mod-bits keycode)))))
+  (bridge/set-passthrough!))
+
 (defn apply-config! [config]
   (let [keymap (effective-keymap config)]
     (swap! kbd-state assoc :buffer-mods (compute-buffer-mods keymap))))
@@ -307,7 +322,8 @@
 (defn update-config! [f & args]
   (let [new-config (apply f (:config @fsm-state) args)]
     (swap! fsm-state assoc :config new-config)
-    (apply-config! new-config)))
+    (apply-config! new-config)
+    (send-keymap-bindings! (effective-keymap new-config))))
 
 ;; ----------------------------------------------------------------
 ;; Entry point
@@ -349,6 +365,7 @@
 
     (bridge/start-bridge! {:socket-path socket-path})
     (bridge/connect! on-key-event :socket-path socket-path)
+    (send-keymap-bindings! (effective-keymap config))
 
     (hud/start! fsm-state fsm/current-menu)
 

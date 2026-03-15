@@ -1,89 +1,95 @@
 (ns tecla.wm.gnome
-  "GNOME backend for wm/action. GNOME 41+ locks down D-Bus shell
-   access, so we use keyboard shortcuts via bridge/emit! for window
-   management and gtk-launch / D-Bus activation for focus-or-launch."
+  "GNOME/Wayland backend for wm/action.
+
+   GNOME 41+ locked down org.gnome.Shell.Eval and
+   org.gnome.Shell.Introspect to privileged callers only, so there is
+   no built-in way to list or activate windows from the outside.
+
+   Window listing/activation requires the 'window-calls' GNOME Shell
+   extension (https://extensions.gnome.org/extension/4724/window-calls/)
+   which exposes a D-Bus interface for List, Focus, etc.
+
+   Basic window management (close, maximize, tiling) uses keyboard
+   shortcuts via bridge/emit!."
   (:require [tecla.wm :as wm]
             [tecla.bridge :as bridge]
             [clojure.java.shell :refer [sh]]
             [clojure.string :as str]
-            [clojure.java.io :as io]))
+            [cheshire.core :as json]))
 
 ;; ----------------------------------------------------------------
-;; Desktop file lookup (for focus-or-launch)
+;; window-calls extension (D-Bus interface)
+;; https://github.com/ickyicky/window-calls
 ;; ----------------------------------------------------------------
 
-(def ^:private desktop-dirs
-  (delay
-    (let [home (System/getenv "HOME")
-          data-home (or (System/getenv "XDG_DATA_HOME")
-                        (str home "/.local/share"))]
-      (filterv #(.isDirectory (io/file %))
-               [(str data-home "/applications")
-                "/usr/share/applications"
-                "/usr/local/share/applications"
-                (str home "/.local/share/flatpak/exports/share/applications")
-                "/var/lib/flatpak/exports/share/applications"]))))
+(def ^:private wc-dest "org.gnome.Shell")
+(def ^:private wc-path "/org/gnome/Shell/Extensions/Windows")
+(def ^:private wc-iface "org.gnome.Shell.Extensions.Windows")
 
-(defn- find-desktop-file
-  "Find a .desktop file matching designator. Tries exact match first,
-   then case-insensitive substring on filename."
+(defonce ^:private ext-checked? (atom false))
+(defonce ^:private ext-available? (atom false))
+
+(defn- extract-gdbus-string
+  "Extract string value from GVariant output: ('json...',) -> json..."
+  [raw]
+  (when raw
+    (when-let [[_ s] (re-find #"(?s)^\('(.*)',\s*\)$" (str/trim raw))]
+      s)))
+
+(defn- wc-call
+  "Call a window-calls extension method via gdbus. Returns raw stdout."
+  [method & args]
+  (let [cmd (into ["gdbus" "call" "--session"
+                    "-d" wc-dest "-o" wc-path
+                    "-m" (str wc-iface "." method)]
+                  (map str args))
+        r (apply sh cmd)]
+    (when (zero? (:exit r))
+      (:out r))))
+
+(defn check-extension!
+  "Check if the window-calls GNOME Shell extension is reachable.
+   Prints a warning on first failure. Returns true/false."
+  []
+  (if @ext-checked?
+    @ext-available?
+    (let [ok? (boolean (wc-call "List"))]
+      (reset! ext-checked? true)
+      (reset! ext-available? ok?)
+      (when-not ok?
+        (println)
+        (println "WARNING: 'window-calls' GNOME Shell extension not detected.")
+        (println "  focus-or-launch and focused-window will not work without it.")
+        (println)
+        (println "  Run:    bb setup:gnome")
+        (println))
+      ok?)))
+
+(defn- list-windows
+  "List all windows via window-calls. Returns seq of maps with
+   :id, :wm_class, :focus, :title, etc. or nil."
+  []
+  (when (or @ext-available? (check-extension!))
+    (when-let [raw (wc-call "List")]
+      (try
+        (json/parse-string (extract-gdbus-string raw) true)
+        (catch Exception _ nil)))))
+
+(defn- find-window-by-class
+  "Find first window whose wm_class matches designator
+   (case-insensitive substring)."
   [designator]
   (let [lower (str/lower-case designator)]
-    (some (fn [dir]
-            (let [files (.listFiles (io/file dir))]
-              (or
-                ;; Exact match: designator.desktop
-                (some #(when (= (.getName %) (str designator ".desktop"))
-                         (.getPath %)) files)
-                ;; Case-insensitive substring
-                (some #(let [n (str/lower-case (.getName %))]
-                         (when (and (str/ends-with? n ".desktop")
-                                    (str/includes? n lower))
-                           (.getPath %))) files))))
-          @desktop-dirs)))
+    (some (fn [w]
+            (when (and (:wm_class w)
+                       (str/includes? (str/lower-case (:wm_class w)) lower))
+              w))
+          (list-windows))))
 
-(defn- desktop-basename
-  "Extract basename from a .desktop file path for gtk-launch."
-  [path]
-  (let [name (.getName (io/file path))]
-    (if (str/ends-with? name ".desktop")
-      (subs name 0 (- (count name) 8))
-      name)))
-
-;; ----------------------------------------------------------------
-;; D-Bus activation (focus existing or launch)
-;; ----------------------------------------------------------------
-
-(defn- dbus-activate
-  "Try to activate an app via org.freedesktop.Application.Activate.
-   Returns true on success."
-  [bus-name obj-path]
-  (try
-    (let [r (sh "gdbus" "call" "--session"
-                "-d" bus-name "-o" obj-path
-                "-m" "org.freedesktop.Application.Activate"
-                "@a{sv}" "{}")]
-      (zero? (:exit r)))
-    (catch Throwable _ false)))
-
-(defn- try-dbus-activate
-  "Try common D-Bus name patterns for a designator."
-  [designator]
-  (let [;; If designator has dots, treat as D-Bus name directly
-        names (if (str/includes? designator ".")
-                [designator]
-                [])
-        ;; Also try to extract app-id from .desktop file
-        desktop (find-desktop-file designator)
-        names (if desktop
-                (let [base (desktop-basename desktop)]
-                  (distinct (conj names base)))
-                names)]
-    (some (fn [name]
-            (let [obj-path (str "/" (str/replace name "." "/"))]
-              (when (dbus-activate name obj-path)
-                true)))
-          names)))
+(defn- focus-window!
+  "Activate a window by its numeric id."
+  [window-id]
+  (wc-call "Focus" (long window-id)))
 
 ;; ----------------------------------------------------------------
 ;; Window actions via keyboard shortcuts
@@ -125,26 +131,21 @@
         designator (if (str/includes? designator ":")
                      (second (str/split designator #":" 2))
                      designator)]
-    ;; Try D-Bus activation first (focuses existing window)
-    (when-not (try-dbus-activate designator)
-      ;; Try gtk-launch with .desktop file
-      (let [desktop (find-desktop-file designator)
-            launched (when desktop
-                       (zero? (:exit (sh "gtk-launch"
-                                         (desktop-basename desktop)))))]
-        ;; Fall back to running the command directly
-        (when-not launched
-          (sh "sh" "-c" app-cmd))))))
+    (if-let [w (find-window-by-class designator)]
+      (focus-window! (:id w))
+      (sh "sh" "-c" app-cmd))))
 
 ;; ----------------------------------------------------------------
 ;; Info queries
 ;; ----------------------------------------------------------------
 
 (defmethod wm/action [:gnome :focused-window] [& _]
-  ;; GNOME 41+ doesn't expose window info via D-Bus.
-  ;; Return nil - callers should handle gracefully.
-  nil)
+  (some (fn [w]
+          (when (:focus w)
+            {:class (:wm_class w)
+             :title (:title w)}))
+        (list-windows)))
 
 (defmethod wm/action [:gnome :resize-active] [_ _dx _dy & _]
-  ;; Not a standard GNOME operation.
+  ;; Not available as a standard GNOME operation.
   nil)

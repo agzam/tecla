@@ -47,6 +47,7 @@ int main(void) {
     struct libevdev *dev = libevdev_new();
     libevdev_set_name(dev, "tecla-test-keyboard");
     libevdev_set_id_bustype(dev, BUS_USB);
+    libevdev_set_phys(dev, "tecla-test/input0");
 
     /* Enable key event type */
     libevdev_enable_event_type(dev, EV_KEY);

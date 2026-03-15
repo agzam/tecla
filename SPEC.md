@@ -210,6 +210,65 @@ tecla/
   uinput access)
 - CI: GitHub Actions runs both
 
+## Known issues
+
+### Rapid-fire key repeats
+
+When Tecla is active, holding a key can produce repeats at a different rate than
+the physical keyboard's configured rate/delay - often much faster, making normal
+typing difficult.
+
+**Root cause (under investigation):**
+
+The physical keyboard is grabbed and its autorepeat events (value=2) are dropped
+by the bridge. The virtual keyboard has kernel-level EV_REP disabled. The
+compositor is expected to be the sole source of key repeat for the virtual
+keyboard.
+
+Despite this, rapid-fire repeats still occur. The issue persists even after:
+
+- Disabling kernel autorepeat on the virtual device via EVIOCSREP ioctl
+- Decoupling the socket reader thread from event processing (queue-based)
+- Switching from non-blocking polling (Thread/sleep) to blocking I/O
+- Adding safety releases for dropped events in the C bridge
+- Reducing the send_to_client poll timeout from 50ms to 5ms
+
+**Remaining hypotheses:**
+
+1. The compositor may apply different repeat parameters to the virtual keyboard
+   than to the physical one. The virtual device is a uinput keyboard that
+   inherits the first grabbed device's input_id (vendor/product/bus) but might
+   still be treated differently by libinput or the compositor's repeat logic.
+
+2. The round-trip latency for intercepted keys (physical -> bridge -> socket ->
+   Babashka -> socket -> bridge -> uinput) may interact badly with the
+   compositor's repeat timer. If the compositor starts its repeat timer upon
+   seeing the virtual press, and the virtual release arrives later than the
+   physical release would have, extra repeats are generated. This would only
+   affect keys routed through Babashka (bound keys and modal mode), not
+   fast-path passthrough keys.
+
+3. The compositor may be seeing the virtual keyboard as a "new" keyboard each
+   session and applying default repeat settings rather than the user's configured
+   values.
+
+4. libinput's keyboard repeat handling may behave unexpectedly for uinput devices
+   that lack EV_REP - it might fall back to aggressive defaults rather than
+   deferring to the compositor.
+
+**Potential approaches not yet tried:**
+
+- Keep EV_REP enabled on the virtual keyboard and copy the physical keyboard's
+  REP_DELAY/REP_PERIOD values, so the virtual device looks identical to the
+  physical one from the compositor's perspective.
+- Forward autorepeat events (value=2) from the physical keyboard through to the
+  virtual keyboard instead of dropping them, letting the physical keyboard's
+  repeat timing drive the output directly.
+- Query the compositor's repeat settings (e.g., via Hyprland IPC or gsettings)
+  and configure the virtual keyboard to match.
+- Move all key processing into the C bridge to eliminate the socket round-trip
+  entirely, using Babashka only for configuration and modal FSM state.
+
 ## Not yet implemented
 
 - Compositor adapters for per-app keymaps

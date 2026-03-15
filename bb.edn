@@ -32,4 +32,33 @@
             :task (shell "bb test/hud_test.clj")}
 
   test {:doc "Run all unit tests"
-        :depends [test:fsm test:core]}}}
+        :depends [test:fsm test:core]}
+
+  setup:gnome
+  {:doc "Install the window-calls GNOME Shell extension (needed for focus-or-launch on GNOME/Wayland)"
+   :task
+   (let [uuid "window-calls@domandoman.xyz"
+         ext-dir (str (System/getProperty "user.home")
+                      "/.local/share/gnome-shell/extensions/" uuid)
+         info (try (:out (shell {:out :string}
+                          "gnome-extensions" "info" uuid))
+                   (catch Exception _ nil))
+         installed? (and info
+                         (re-find (re-pattern "ACTIVE|ENABLED")
+                                  (str info)))]
+     (if installed?
+       (println "window-calls is already installed and active.")
+       (let [tmp-dir (str "/tmp/window-calls-" (System/currentTimeMillis))]
+         (println "Cloning window-calls from GitHub...")
+         (shell "git" "clone" "--depth" "1"
+                "https://github.com/ickyicky/window-calls.git" tmp-dir)
+         (shell "mkdir" "-p" ext-dir)
+         (shell "cp" (str tmp-dir "/extension.js") ext-dir)
+         (shell "cp" (str tmp-dir "/metadata.json") ext-dir)
+         (shell "rm" "-rf" tmp-dir)
+         (println "Enabling extension...")
+         (try (shell "gnome-extensions" "enable" uuid)
+              (catch Exception _
+                (println "Could not enable - you may need to log out and back in first.")))
+         (println)
+         (println "Done. If the extension doesn't activate, log out and back in."))))}}}
