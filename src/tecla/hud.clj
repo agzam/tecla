@@ -35,15 +35,23 @@
   (let [items (keep (fn [[k entry]]
                       (when (and (map? entry) (:desc entry))
                         (str "{\"key\":\"" (key-label k) "\""
-                             ",\"desc\":\"" (:desc entry) "\"}")))
+                             ",\"desc\":\"" (:desc entry) "\""
+                             (when (:keys entry) ",\"sub\":true")
+                             "}")))
                     menu)]
     (str "[" (str/join "," items) "]")))
 
-(defn- show-menu! [menu]
-  (let [title (or (:desc (meta menu)) "")
+(defn- path-json
+  "Build JSON array of breadcrumb path segments from the menu stack."
+  [menu-stack]
+  (let [segments (keep #(:desc (meta %)) menu-stack)]
+    (str "[" (str/join "," (map #(str "\"" % "\"") segments)) "]")))
+
+(defn- show-menu! [menu-stack]
+  (let [menu (peek menu-stack)
         keys-json (menu->keys-json menu)]
-    (send! (str "{\"show\":true,\"name\":\"" title
-                "\",\"keys\":" keys-json "}"))))
+    (send! (str "{\"show\":true,\"path\":" (path-json menu-stack)
+                ",\"keys\":" keys-json "}"))))
 
 (defn- hide-menu! []
   (send! "{\"show\":false}"))
@@ -52,7 +60,7 @@
 ;; Poller
 ;; ----------------------------------------------------------------
 
-(defn- start-poller! [fsm-state-atom current-menu-fn]
+(defn- start-poller! [fsm-state-atom _current-menu-fn]
   (reset! poller-running true)
   (doto (Thread.
           (fn []
@@ -69,9 +77,8 @@
                       (and (= :modal mode)
                            (or (not= :modal (:mode p))
                                (not= stack-id (:stack-id p))))
-                      (let [menu (current-menu-fn s)]
-                        (show-menu! menu)
-                        (reset! prev {:mode mode :stack-id stack-id}))
+                      (do (show-menu! stack)
+                          (reset! prev {:mode mode :stack-id stack-id}))
 
                       ;; Left modal
                       (and (= :modal (:mode p)) (not= :modal mode))
@@ -81,7 +88,7 @@
                       ;; No change
                       :else nil))
                   (catch Throwable _))
-                (Thread/sleep 50)))))
+                (Thread/sleep 16)))))
     (.setDaemon true)
     (.start)))
 
