@@ -103,6 +103,90 @@
       (dispatch (str "focuswindow address:" (:address matching)))
       (dispatch (str "exec " command)))))
 
+(defmethod wm/action [:hyprland :toggle-floating] [& _] (dispatch "togglefloating"))
+(defmethod wm/action [:hyprland :pin]             [& _] (dispatch "pin"))
+(defmethod wm/action [:hyprland :minimize]         [& _]
+  (dispatch "movetoworkspacesilent special:minimized"))
+(defmethod wm/action [:hyprland :move-to-monitor]  [& _]
+  (dispatch "movewindow mon:+1"))
+
+(defmethod wm/action [:hyprland :send-shortcut] [_ mods key window]
+  (dispatch (str "sendshortcut " mods "," key "," window)))
+
+(defmethod wm/action [:hyprland :focus-window-by-address] [_ address]
+  (dispatch (str "focuswindow address:" address)))
+
 (defmethod wm/action [:hyprland :focused-window] [& _]
   (when-let [w (hypr-cmd "activewindow")]
-    (select-keys w [:class :title])))
+    (select-keys w [:address :class :title])))
+
+;; ----------------------------------------------------------------
+;; Event listener (socket2 - async events)
+;; ----------------------------------------------------------------
+
+(defonce ^:private event-listener (atom nil))
+
+(defn- find-event-socket
+  "Find the Hyprland event socket (.socket2.sock)."
+  []
+  (let [runtime (System/getenv "XDG_RUNTIME_DIR")
+        sig (System/getenv "HYPRLAND_INSTANCE_SIGNATURE")
+        hypr-dir (java.io.File. (str runtime "/hypr"))]
+    (when (and runtime (.isDirectory hypr-dir))
+      (let [candidates
+            (if sig
+              (cons (java.io.File. hypr-dir sig)
+                    (remove #(= (.getName %) sig)
+                            (sort-by #(- (.lastModified %))
+                                     (.listFiles hypr-dir))))
+              (sort-by #(- (.lastModified %)) (.listFiles hypr-dir)))]
+        (some (fn [dir]
+                (let [sock (java.io.File. dir ".socket2.sock")]
+                  (when (.exists sock)
+                    (.getPath sock))))
+              candidates)))))
+
+(defmethod wm/start-focus-listener! :hyprland [callback]
+  (when-let [sock-path (find-event-socket)]
+    (let [running (atom true)
+          thread
+          (doto (Thread.
+                  (fn []
+                    (while @running
+                      (try
+                        (with-open [ch (SocketChannel/open StandardProtocolFamily/UNIX)]
+                          (.connect ch (UnixDomainSocketAddress/of sock-path))
+                          (let [buf (ByteBuffer/allocate 4096)
+                                sb (StringBuilder.)]
+                            (while (and @running (pos? (.read ch buf)))
+                              (.flip buf)
+                              (let [raw (String. (.array buf) 0 (.limit buf) "UTF-8")]
+                                (.append sb raw)
+                                (loop []
+                                  (let [s (.toString sb)
+                                        idx (.indexOf s "\n")]
+                                    (when (>= idx 0)
+                                      (let [line (.substring s 0 idx)]
+                                        (.delete sb 0 (inc idx))
+                                        (when (str/starts-with? line "activewindow>>")
+                                          (let [data (subs line (count "activewindow>>"))
+                                                comma (.indexOf data ",")]
+                                            (when (pos? comma)
+                                              (callback (.substring data 0 comma)))))
+                                        (recur))))))
+                              (.clear buf))))
+                        (catch Exception e
+                          (when @running
+                            (println "Hyprland event listener error:" (.getMessage e))
+                            (Thread/sleep 2000))))))
+                  "tecla-hyprland-events")
+            (.setDaemon true)
+            (.start))]
+      (reset! event-listener {:running running :thread thread})
+      (println "Hyprland event listener started"))))
+
+(defmethod wm/stop-focus-listener! :hyprland []
+  (when-let [{:keys [running]} @event-listener]
+    (reset! running false)
+    (reset! event-listener nil)
+    (println "Hyprland event listener stopped")))

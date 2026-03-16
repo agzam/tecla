@@ -8,11 +8,14 @@
             [babashka.nrepl.server :as nrepl]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.java.shell :refer [sh]]))
+            [clojure.java.shell :refer [sh]]
+            [clojure.string :as str]))
 
 (defonce fsm-state (atom nil))
 (defonce nrepl-server (atom nil))
 (defonce config-watcher (atom nil))
+(defonce focused-app (atom nil))
+(defonce pre-modal-window (atom nil))
 
 ;; ----------------------------------------------------------------
 ;; Keyboard state
@@ -64,10 +67,20 @@
             keymap))))
 
 (defn- effective-keymap
-  "Get the effective keymap: app-local merged on top of global."
+  "Get the effective keymap: app-local merged on top of global.
+   When a focused app matches a key in :app-local-keymap, those
+   bindings override the global ones."
   [config]
-  ;; TODO: merge app-local-keymap when compositor adapter is ready
-  (:global-keymap config))
+  (let [global (:global-keymap config)
+        app-class (some-> @focused-app str/lower-case)
+        local (when app-class
+                (some (fn [[k v]]
+                        (when (= (str/lower-case (name k)) app-class)
+                          v))
+                      (:app-local-keymap config)))]
+    (if local
+      (merge global local)
+      global)))
 
 ;; ----------------------------------------------------------------
 ;; Value dispatch - the "smart" part
@@ -90,7 +103,8 @@
 
 (def ^:private form-aliases
   "Short namespace aliases for config EDN forms."
-  {"wm" "tecla.wm"})
+  {"wm" "tecla.wm"
+   "media" "tecla.media"})
 
 (defn- expand-sym
   "Expand short aliases: wm/focus-left -> tecla.wm/focus-left"
@@ -159,22 +173,57 @@
     true))
 
 ;; ----------------------------------------------------------------
+;; Bridge keymap bindings (must precede handle-effect)
+;; ----------------------------------------------------------------
+
+(defn- send-keymap-bindings!
+  "Push keymap bindings to the bridge for fast-path passthrough."
+  [keymap]
+  (bridge/send-clear!)
+  (doseq [[combo _] keymap]
+    (when (vector? combo)
+      (let [mods    (butlast combo)
+            key     (last combo)
+            mod-bits (keys/mods->bits mods)
+            keycode  (keys/key->code key)]
+        (when keycode
+          (bridge/send-binding! mod-bits keycode)))))
+  (bridge/set-passthrough!))
+
+;; ----------------------------------------------------------------
 ;; Effect handling
 ;; ----------------------------------------------------------------
+
+(defn- restore-pre-modal-focus!
+  "Refocus the window that was active before entering modal mode.
+   Ensures WM actions target the right window, not the HUD."
+  []
+  (when-let [{:keys [address]} @pre-modal-window]
+    (wm/focus-window-by-address address)))
 
 (defn handle-effect [effect]
   (when effect
     (case (:type effect)
-      :enter-modal (bridge/set-intercept!)
+      :enter-modal (do (reset! pre-modal-window
+                               (try (wm/focused-window)
+                                    (catch Exception _ nil)))
+                       (bridge/set-intercept!))
       :exit-modal (do
+                    (reset! pre-modal-window nil)
                     (swap! kbd-state assoc :buffered-mods 0 :consumed-mods 0)
                     (let [ms (:mod-state @kbd-state)]
                       (doseq [bit [1 2 4 8]]
                         (when (pos? (bit-and ms bit))
                           (bridge/emit! (keys/mod-bit->code bit) 1))))
-                    (bridge/set-passthrough!))
-      :action (dispatch-value! (:action effect))
-      :action-and-exit (do (dispatch-value! (:action effect))
+                    ;; Rebind for the (possibly changed) focused app,
+                    ;; also sets passthrough mode
+                    (let [keymap (effective-keymap (:config @fsm-state))]
+                      (swap! kbd-state assoc :buffer-mods (compute-buffer-mods keymap))
+                      (send-keymap-bindings! keymap)))
+      :action (do (restore-pre-modal-focus!)
+                  (dispatch-value! (:action effect)))
+      :action-and-exit (do (restore-pre-modal-focus!)
+                           (dispatch-value! (:action effect))
                            (handle-effect {:type :exit-modal}))
       nil)))
 
@@ -319,20 +368,6 @@
     (edn/read-string (slurp path))
     (throw (ex-info (str "Config not found: " path) {:path path}))))
 
-(defn- send-keymap-bindings!
-  "Push keymap bindings to the bridge for fast-path passthrough."
-  [keymap]
-  (bridge/send-clear!)
-  (doseq [[combo _] keymap]
-    (when (vector? combo)
-      (let [mods    (butlast combo)
-            key     (last combo)
-            mod-bits (keys/mods->bits mods)
-            keycode  (keys/key->code key)]
-        (when keycode
-          (bridge/send-binding! mod-bits keycode)))))
-  (bridge/set-passthrough!))
-
 (defn apply-config! [config]
   (let [keymap (effective-keymap config)]
     (swap! kbd-state assoc :buffer-mods (compute-buffer-mods keymap))))
@@ -373,6 +408,24 @@
     (send-keymap-bindings! keymap)
     (println "Config reloaded:" path)))
 
+(defn- on-focus-change!
+  "Called by the WM event listener when the focused window changes.
+   Updates focused-app atom always, but only rebinds the bridge when
+   NOT in modal mode (rebinding calls set-passthrough! which would
+   knock the bridge out of intercept mode)."
+  [app-class]
+  (let [prev @focused-app
+        config (:config @fsm-state)]
+    (reset! focused-app app-class)
+    (when (and config (not= :modal (:mode @fsm-state)))
+      (let [lk (fn [c] (some-> c str/lower-case keyword))
+            prev-local (get-in config [:app-local-keymap (lk prev)])
+            curr-local (get-in config [:app-local-keymap (lk app-class)])]
+        (when (or prev-local curr-local)
+          (let [keymap (effective-keymap config)]
+            (swap! kbd-state assoc :buffer-mods (compute-buffer-mods keymap))
+            (send-keymap-bindings! keymap)))))))
+
 (defn- start-config-watcher!
   "Poll the config directory every 2s. When any file changes, reload.
    Runs in a daemon thread - never touches the key processing path."
@@ -407,6 +460,7 @@
 
 (defn stop! []
   (stop-config-watcher!)
+  (wm/stop-focus-listener!)
   (hud/stop!)
   (hud/kill!)
   (when @nrepl-server
@@ -445,6 +499,7 @@
     (send-keymap-bindings! (effective-keymap config))
 
     (hud/start! fsm-state fsm/current-menu)
+    (wm/start-focus-listener! on-focus-change!)
 
     (let [srv (try (nrepl/start-server! {:host "127.0.0.1" :port nrepl-port})
                    (catch java.net.BindException _

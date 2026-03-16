@@ -11,6 +11,11 @@
   [:super :w] [:ctrl :w]
   [:super :t] [:ctrl :t]
   [:super :f] [:ctrl :f]
+  [:alt :backspace] [:ctrl :backspace]
+
+  ;; --- Shell commands ---
+  [:super :ctrl :p] "cliphist list | wofi --dmenu | cliphist decode | wl-copy"
+  [:super :ctrl :5] "flameshot gui"
 
   ;; --- Modal ---
   [:super :space]
@@ -38,8 +43,16 @@
                :l {:desc "Right" :action (wm/focus-right)}
                :j {:desc "Down"  :action (wm/focus-down)}
                :k {:desc "Up"    :action (wm/focus-up)}
+               [:shift :h] {:desc "Move Left"  :action (wm/move-left)}
+               [:shift :l] {:desc "Move Right" :action (wm/move-right)}
+               [:shift :j] {:desc "Move Down"  :action (wm/move-down)}
+               [:shift :k] {:desc "Move Up"    :action (wm/move-up)}
                :m {:desc "Maximize"   :action (wm/maximize)}
                :c {:desc "Close"      :action (wm/close-window)}
+               :f {:desc "Float"      :action (wm/toggle-floating)}
+               :s {:desc "Pin"        :action (wm/pin)}
+               :minus {:desc "Minimize" :action (wm/minimize)}
+               :o {:desc "Other Mon"  :action (wm/move-to-monitor)}
                :r {:desc "Resize" :transient true
                    :keys {:h {:desc "Shrink W" :action (wm/resize-active -20 0)}
                           :l {:desc "Grow W"   :action (wm/resize-active 20 0)}
@@ -47,9 +60,38 @@
                           :k {:desc "Shrink H" :action (wm/resize-active 0 -20)}}}}}
 
     :m {:desc "Media"
-        :keys {:k {:desc "Vol Up"   :action "pactl set-sink-volume @DEFAULT_SINK@ +5%"}
+        :keys {:a {:desc "Music App"
+                   :action (wm/focus-or-launch
+                            {:class "brave-cinhimbnkkaeohfgghhklpknlkffjgod-Default"
+                             :command "brave --app-id=cinhimbnkkaeohfgghhklpknlkffjgod --ozone-platform=wayland"})}
+               :k {:desc "Vol Up"   :action "pactl set-sink-volume @DEFAULT_SINK@ +5%"}
                :j {:desc "Vol Down" :action "pactl set-sink-volume @DEFAULT_SINK@ -5%"}
+               :v {:desc "Vol Ctrl" :action "pavucontrol"}
                :m {:desc "Mute"     :action "pactl set-sink-mute @DEFAULT_SINK@ toggle"}
-               :space {:desc "Play/Pause" :action "playerctl play-pause"}
-               :l {:desc "Next"     :action "playerctl next"}
-               :h {:desc "Prev"     :action "playerctl previous"}}}}}}}
+               :s {:desc "Play/Pause" :action (media/music-app-press-key :semicolon)}
+               :l {:desc "Next"     :action (media/music-app-press-key :n :mods "Shift")}
+               :h {:desc "Prev"     :action (media/music-app-press-key :p :mods "Shift")}
+               [:shift :3] {:desc "Hate" :action (media/music-app-press-key :minus :mods "Shift")}
+               [:shift :8] {:desc "Like" :action (media/music-app-press-key :equal :mods "Shift")}
+               :slash {:desc "Search" :action (media/music-app-press-key :slash :remain? true)}
+               :space {:desc "playerctl" :action "playerctl play-pause"}}}}}}}
+
+ ;; --- Per-app overrides (merged on top of global-keymap) ---
+ :app-local-keymap
+ {:brave-browser
+  {[:ctrl :n] [:down]
+   [:ctrl :p] [:up]
+   [:super :l] [:ctrl :l]
+   [:super :j] [:ctrl :shift :tab]
+   [:super :k] [:ctrl :tab]
+   [:super :t] [:ctrl :t]
+   [:super :shift :t] [:ctrl :shift :t]}
+
+  :kitty
+  {[:super :t] [:ctrl :shift :t]
+   [:super :w] [:ctrl :shift :w]
+   [:super :v] [:ctrl :shift :v]
+   [:super :c] [:ctrl :shift :c]}
+
+  :slack
+  {[:super :k] [:ctrl :k]}}}

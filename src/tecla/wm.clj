@@ -54,3 +54,28 @@
   ([class command]
    (action :focus-or-launch {:class (str class) :command (str command)})))
 (defn resize-active     [& args] (apply action :resize-active args))
+(defn toggle-floating   [& args] (apply action :toggle-floating args))
+(defn pin               [& args] (apply action :pin args))
+(defn minimize          [& args] (apply action :minimize args))
+(defn move-to-monitor   [& args] (apply action :move-to-monitor args))
+(defn send-shortcut     [& args] (apply action :send-shortcut args))
+(defn focus-window-by-address [& args] (apply action :focus-window-by-address args))
+
+;; --- Focus change listener ---
+
+(defmulti start-focus-listener!
+  "Start listening for window focus changes. Calls `callback` with
+   the window class name (string) whenever the focused window changes.
+   Returns a stop function."
+  (fn [_callback] @compositor))
+
+(defmethod start-focus-listener! :default [_]
+  (println "wm/start-focus-listener!: not implemented for" @compositor)
+  (constantly nil))
+
+(defmulti stop-focus-listener!
+  "Stop the focus change listener."
+  (fn [] @compositor))
+
+(defmethod stop-focus-listener! :default []
+  nil)
