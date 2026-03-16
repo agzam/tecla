@@ -362,10 +362,49 @@
         (spit path (slurp example))
         (println "Created" path "from config.example.edn")))))
 
+(defn- read-edn-ordered
+  "Read one EDN form, using array-maps for all map literals so that
+   key order from the source file is preserved (HUD display order).
+   Non-map forms delegate to clojure.edn/read."
+  [s]
+  (let [rdr (java.io.PushbackReader. (java.io.StringReader. s) 16)]
+    (letfn [(skip-ws []
+              (loop []
+                (let [ch (.read rdr)]
+                  (cond
+                    (neg? ch) nil
+                    (or (Character/isWhitespace (char ch))
+                        (= (char ch) \,))
+                    (recur)
+                    (= (char ch) \;)
+                    (do (loop []
+                          (let [c (.read rdr)]
+                            (when (and (>= c 0) (not= (char c) \newline))
+                              (recur))))
+                        (recur))
+                    :else (.unread rdr ch)))))
+            (read-form []
+              (skip-ws)
+              (let [ch (.read rdr)]
+                (cond
+                  (neg? ch) ::eof
+                  (= (char ch) \{) (read-map)
+                  :else (do (.unread rdr ch)
+                            (edn/read {:eof ::eof} rdr)))))
+            (read-map []
+              (loop [kvs []]
+                (skip-ws)
+                (let [ch (.read rdr)]
+                  (if (or (neg? ch) (= (char ch) \}))
+                    (apply array-map kvs)
+                    (do (.unread rdr ch)
+                        (recur (conj kvs (read-form) (read-form))))))))]
+      (read-form))))
+
 (defn load-config [path]
   (ensure-config! path)
   (if (.exists (io/file path))
-    (edn/read-string (slurp path))
+    (read-edn-ordered (slurp path))
     (throw (ex-info (str "Config not found: " path) {:path path}))))
 
 (defn apply-config! [config]
