@@ -17,6 +17,9 @@
 (defonce focused-app (atom nil))
 (defonce pre-modal-window (atom nil))
 
+;; Software key-repeat for transient menus (bridge drops hardware autorepeat)
+(defonce ^:private repeat-state (atom {:key-code nil :future nil}))
+
 ;; ----------------------------------------------------------------
 ;; Keyboard state
 ;; ----------------------------------------------------------------
@@ -201,6 +204,37 @@
   (when-let [{:keys [address]} @pre-modal-window]
     (wm/focus-window-by-address address)))
 
+;; ----------------------------------------------------------------
+;; Transient menu key repeat
+;; ----------------------------------------------------------------
+
+(defn- stop-repeat! []
+  (when-let [f (:future @repeat-state)]
+    (future-cancel f))
+  (reset! repeat-state {:key-code nil :future nil}))
+
+(defn- start-repeat!
+  "Begin software auto-repeat for a transient menu action.
+   After an initial delay, repeatedly dispatches `action` until the
+   key is released (stop-repeat!) or modal exits."
+  [code action]
+  (stop-repeat!)
+  (let [delay-ms    300
+        interval-ms 50
+        f (future
+            (try
+              (Thread/sleep delay-ms)
+              (loop []
+                (when (= code (:key-code @repeat-state))
+                  (restore-pre-modal-focus!)
+                  (dispatch-value! action)
+                  (Thread/sleep interval-ms)
+                  (recur)))
+              (catch InterruptedException _)
+              (catch Exception e
+                (println "Repeat error:" (.getMessage e)))))]
+    (reset! repeat-state {:key-code code :future f})))
+
 (defn handle-effect [effect]
   (when effect
     (case (:type effect)
@@ -209,6 +243,7 @@
                                     (catch Exception _ nil)))
                        (bridge/set-intercept!))
       :exit-modal (do
+                    (stop-repeat!)
                     (reset! pre-modal-window nil)
                     (swap! kbd-state assoc :buffered-mods 0 :consumed-mods 0)
                     (let [ms (:mod-state @kbd-state)]
@@ -270,11 +305,15 @@
               mods   (:mod-state @state)
               new-fsm (swap! fsm-state fsm/process-event
                              {:type :key :key key-kw
-                              :mods mods :press? true})]
-          (handle-effect (:effect new-fsm))
+                              :mods mods :press? true})
+              effect (:effect new-fsm)]
+          (when (= :action (:type effect))
+            (start-repeat! code (:action effect)))
+          (handle-effect effect)
           (swap! fsm-state assoc :effect nil))
 
-        :else nil)
+        release?
+        (stop-repeat!))
 
       ;; === PASSTHROUGH MODE ===
 
