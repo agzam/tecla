@@ -1,7 +1,5 @@
-{;; :compositor :hyprland  ;; auto-detected if not set
-
- :global-keymap
- {;; --- Remaps (Mac-like) ---
+{:global-keymap
+ {;; --- Global Remaps ---
   [:super :c] [:ctrl :c]
   [:super :v] [:ctrl :v]
   [:super :a] [:ctrl :a]
@@ -21,7 +19,9 @@
   [:super :space]
   {:desc "Main"
    :keys
-   {:a {:desc "Apps"
+   {:space
+    {:action "rofi -config ./rofi.rasi -show combi -modi combi,window,drun"}
+    :a {:desc "Apps"
         :keys {:e {:desc "Emacs" :action (wm/focus-or-launch {:class "Emacs" :command "emacs"})}
                :i {:desc "Kitty" :action (wm/focus-or-launch {:class "kitty"})}
                :b {:desc "Brave"
@@ -76,12 +76,9 @@
                :slash {:desc "Search" :action (media/music-app-press-key :slash :remain? true)}
                :space {:desc "playerctl" :action "playerctl play-pause"}}}}}}
 
-   ;; --- Per-app overrides (merged on top of global-keymap) ---
-   ;; Keys can be keywords (exact match) or strings (regex pattern).
-   ;; When multiple entries match, they are merged (keyword > string).
+ ;; --- Per-app overrides ---
  :app-local-keymap
- {;; Shared browser bindings (string key = regex pattern)
-  "brave-browser|firefox"
+ {:brave-browser
   {[:ctrl :n] [:down]
    [:ctrl :p] [:up]
    [:super :l] [:ctrl :l]
@@ -89,7 +86,7 @@
    [:super :k] [:ctrl :tab]
    [:super :t] [:ctrl :t]
    [:super :shift :t] [:ctrl :shift :t]
-   ;; Mac-like Cmd+Click &  Cmd+Shift+Click
+    ;; Mac-like Cmd+Click & Cmd+Shift+Click
    [:super :mouse-left] [:ctrl :mouse-left]
    [:super :shift :mouse-left] [:ctrl :shift :mouse-left]}
 
