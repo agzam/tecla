@@ -41,7 +41,11 @@
    113 :mute, 114 :volume-down, 115 :volume-up
    125 :left-meta
    126 :right-meta
-   127 :compose})
+   127 :compose
+   ;; Mouse buttons (from linux/input-event-codes.h BTN_* defines)
+   272 :mouse-left
+   273 :mouse-right
+   274 :mouse-middle})
 
 (def key->code
   (into {} (map (fn [[c k]] [k c])) code->key))
@@ -98,6 +102,17 @@
     42 54     ;; KEY_LEFTSHIFT KEY_RIGHTSHIFT
     56 100    ;; KEY_LEFTALT KEY_RIGHTALT
     125 126}) ;; KEY_LEFTMETA KEY_RIGHTMETA
+
+(def mouse-button-codes
+  "Set of evdev keycodes that are mouse buttons."
+  #{272    ;; BTN_LEFT
+    273    ;; BTN_RIGHT
+    274})  ;; BTN_MIDDLE
+
+(defn mouse-button?
+  "Is this evdev keycode a mouse button?"
+  [code]
+  (contains? mouse-button-codes code))
 
 (defn modifier-code?
   "Is this evdev keycode a modifier?"

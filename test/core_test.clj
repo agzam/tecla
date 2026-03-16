@@ -58,13 +58,29 @@
                                       :keys {:w {:desc "Wireshark" :action "echo wireshark"}}}}}}}
             :w {:desc "Windows"
                 :keys {:h {:desc "Left" :action "echo left"}}}
-            :x {:desc "Execute" :action "echo exec"}}}}})
+            :x {:desc "Execute" :action "echo exec"}}}}
+
+   :app-local-keymap
+   {:brave-browser
+    {[:ctrl :n] [:down]
+     [:ctrl :p] [:up]
+     [:super :l] [:ctrl :l]}}})
 
 (defn reset-state! []
   (reset! core/fsm-state (fsm/init config))
+  (reset! core/focused-app nil)
   (reset! core/kbd-state
           {:mod-state 0 :buffered-mods 0 :consumed-mods 0
            :active-sims {} :buffer-mods (core/compute-buffer-mods (:global-keymap config))})
+  (clear!))
+
+(defn reset-state-with-app!
+  "Reset state and simulate being focused on a specific app."
+  [app-class]
+  (reset-state!)
+  (reset! core/focused-app app-class)
+  (let [keymap (#'core/effective-keymap config)]
+    (swap! core/kbd-state assoc :buffer-mods (core/compute-buffer-mods keymap)))
   (clear!))
 
 ;; ================================================================
@@ -283,6 +299,69 @@
   (clear!)
   (tap KEY_X) ;; plain x, no [:shift :x] or [:ctrl :shift :x] match - swallowed
   (assert= :modal (:mode @core/fsm-state) "still in modal"))
+
+;; ---- App-local keymap tests ----
+
+(def KEY_N 49) (def KEY_P 25) (def KEY_L 38) (def KEY_DOWN 108) (def KEY_UP 103)
+
+(deftest "app-local: effective-keymap merges when focused on brave"
+  (reset-state!)
+  (reset! core/focused-app "brave-browser")
+  (let [keymap (#'core/effective-keymap config)]
+    ;; App-local entry exists
+    (assert= [:down] (get keymap [:ctrl :n]) "ctrl+n -> down")
+    ;; Global entry preserved
+    (assert= [:ctrl :c] (get keymap [:super :c]) "super+c -> ctrl+c")))
+
+(deftest "app-local: effective-keymap global-only when no app"
+  (reset-state!)
+  (reset! core/focused-app nil)
+  (let [keymap (#'core/effective-keymap config)]
+    (assert= nil (get keymap [:ctrl :n]) "no ctrl+n in global")))
+
+(deftest "app-local: case-insensitive matching"
+  (reset-state!)
+  (reset! core/focused-app "Brave-browser")
+  (let [keymap (#'core/effective-keymap config)]
+    (assert= [:down] (get keymap [:ctrl :n]) "case-insensitive match")))
+
+(deftest "app-local: find-app-local works"
+  (reset-state!)
+  (assert= true (some? (#'core/find-app-local config "brave-browser")) "lowercase")
+  (assert= true (some? (#'core/find-app-local config "Brave-browser")) "mixed-case")
+  (assert= true (some? (#'core/find-app-local config "BRAVE-BROWSER")) "uppercase")
+  (assert= nil (#'core/find-app-local config "firefox") "no match"))
+
+(deftest "app-local: Ctrl+N -> Down in brave"
+  (reset-state-with-app! "brave-browser")
+  (combo CTRL KEY_N)
+  (assert= true (emitted? KEY_DOWN 1) "Down press")
+  (assert= true (emitted? KEY_DOWN 0) "Down release")
+  (assert= true (not-emitted? KEY_N 1) "N not emitted")
+  (assert= true (not-emitted? CTRL 1) "Ctrl not emitted"))
+
+(deftest "app-local: Ctrl+P -> Up in brave"
+  (reset-state-with-app! "brave-browser")
+  (combo CTRL KEY_P)
+  (assert= true (emitted? KEY_UP 1) "Up press")
+  (assert= true (emitted? KEY_UP 0) "Up release"))
+
+(deftest "app-local: global remap still works in brave"
+  (reset-state-with-app! "brave-browser")
+  (combo SUPER (keys/key->code :c))
+  (assert= true (emitted? CTRL 1) "Ctrl")
+  (assert= true (not-emitted? SUPER 1) "no Super"))
+
+(deftest "app-local: Ctrl+N passes through when not on brave"
+  (reset-state!)
+  (reset! core/focused-app "kitty")
+  (let [keymap (#'core/effective-keymap config)]
+    (swap! core/kbd-state assoc :buffer-mods (core/compute-buffer-mods keymap)))
+  (clear!)
+  (combo CTRL KEY_N)
+  ;; Ctrl and N should pass through (no remap)
+  (assert= true (emitted? CTRL 1) "Ctrl passed through")
+  (assert= true (emitted? KEY_N 1) "N passed through"))
 
 ;; ================================================================
 (println)

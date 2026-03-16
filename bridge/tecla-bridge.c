@@ -1,8 +1,8 @@
 /*
  * tecla-bridge - thin evdev/uinput I/O bridge
  *
- * Grabs ALL keyboards, creates a single virtual keyboard.
- * Forwards key events to a Babashka client via Unix socket.
+ * Grabs ALL keyboards and mice, creates virtual keyboard + mouse.
+ * Forwards key/button events to a Babashka client via Unix socket.
  * When no client is connected, auto-passthroughs everything.
  *
  * Protocol:
@@ -32,11 +32,13 @@
 
 #define MAX_DEVICES 16
 #define VKBD_NAME "tecla-virtual-keyboard"
+#define VMOUSE_NAME "tecla-virtual-mouse"
 
 static volatile int running = 1;
 static int debug = 0;
 static int allow_virtual = 0;   /* --allow-virtual: skip phys check (for tests) */
-static dev_t uinput_devnum = 0; /* our virtual device, skip during scan */
+static dev_t uinput_devnum = 0; /* our virtual keyboard, skip during scan */
+static dev_t umouse_devnum = 0; /* our virtual mouse, skip during scan */
 
 static struct {
     struct libevdev *dev;
@@ -45,7 +47,15 @@ static struct {
 } devices[MAX_DEVICES];
 static int device_count = 0;
 
+static struct {
+    struct libevdev *dev;
+    int fd;
+    char name[128];
+} mice[MAX_DEVICES];
+static int mouse_count = 0;
+
 static struct libevdev_uinput *uidev = NULL;
+static struct libevdev_uinput *umouse = NULL;
 static int listen_fd = -1;
 static int client_fd = -1;
 static int inotify_fd = -1;
@@ -71,6 +81,7 @@ static void cleanup(void) {
     if (listen_fd >= 0) { close(listen_fd); listen_fd = -1; }
     if (socket_path[0]) unlink(socket_path);
     if (uidev) { libevdev_uinput_destroy(uidev); uidev = NULL; }
+    if (umouse) { libevdev_uinput_destroy(umouse); umouse = NULL; }
     for (int i = 0; i < device_count; i++) {
         if (devices[i].dev) {
             libevdev_grab(devices[i].dev, LIBEVDEV_UNGRAB);
@@ -78,6 +89,14 @@ static void cleanup(void) {
             devices[i].dev = NULL;
         }
         if (devices[i].fd >= 0) { close(devices[i].fd); devices[i].fd = -1; }
+    }
+    for (int i = 0; i < mouse_count; i++) {
+        if (mice[i].dev) {
+            libevdev_grab(mice[i].dev, LIBEVDEV_UNGRAB);
+            libevdev_free(mice[i].dev);
+            mice[i].dev = NULL;
+        }
+        if (mice[i].fd >= 0) { close(mice[i].fd); mice[i].fd = -1; }
     }
 }
 
@@ -135,8 +154,10 @@ static int fp_has_nomods_binding(int keycode) {
 }
 
 static void fp_emit(int code, int value) {
-    libevdev_uinput_write_event(uidev, EV_KEY, code, value);
-    libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+    struct libevdev_uinput *target =
+        (code >= BTN_MISC && umouse) ? umouse : uidev;
+    libevdev_uinput_write_event(target, EV_KEY, code, value);
+    libevdev_uinput_write_event(target, EV_SYN, SYN_REPORT, 0);
 }
 
 static void fp_reset(void) {
@@ -148,16 +169,23 @@ static void fp_reset(void) {
 }
 
 static void fp_release_stuck(void) {
-    int any = 0;
+    int any_key = 0, any_btn = 0;
     for (int i = 0; i <= KEY_MAX; i++) {
         if (fp_sent[i]) {
-            libevdev_uinput_write_event(uidev, EV_KEY, i, 0);
+            if (i >= BTN_MISC && umouse) {
+                libevdev_uinput_write_event(umouse, EV_KEY, i, 0);
+                any_btn = 1;
+            } else {
+                libevdev_uinput_write_event(uidev, EV_KEY, i, 0);
+                any_key = 1;
+            }
             fp_sent[i] = 0;
-            any = 1;
         }
     }
-    if (any)
+    if (any_key)
         libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+    if (any_btn)
+        libevdev_uinput_write_event(umouse, EV_SYN, SYN_REPORT, 0);
 }
 
 static void fp_route_key(int code, int value) {
@@ -233,6 +261,26 @@ static int is_keyboard(struct libevdev *d) {
         && libevdev_has_event_code(d, EV_KEY, KEY_LEFTCTRL);
 }
 
+static int is_mouse(struct libevdev *d) {
+    if (!allow_virtual) {
+        const char *phys = libevdev_get_phys(d);
+        if (!phys || phys[0] == '\0')
+            return 0;
+    }
+    const char *name = libevdev_get_name(d);
+    if (name && strcmp(name, VMOUSE_NAME) == 0)
+        return 0;
+    if (libevdev_get_id_bustype(d) == BUS_VIRTUAL)
+        return 0;
+
+    /* Relative-axis pointer with at least a left button.
+     * Excludes touchpads (EV_ABS) to avoid breaking libinput gestures. */
+    return libevdev_has_event_type(d, EV_REL)
+        && libevdev_has_event_code(d, EV_REL, REL_X)
+        && libevdev_has_event_code(d, EV_REL, REL_Y)
+        && libevdev_has_event_code(d, EV_KEY, BTN_LEFT);
+}
+
 static void list_devices(void) {
     char path[64];
     printf("Available input devices:\n\n");
@@ -242,15 +290,17 @@ static void list_devices(void) {
         if (fd < 0) continue;
         struct libevdev *d = NULL;
         if (libevdev_new_from_fd(fd, &d) == 0) {
-            printf("  %s: %s%s\n", path, libevdev_get_name(d),
-                   is_keyboard(d) ? " [keyboard]" : "");
+            const char *tag = is_keyboard(d) ? " [keyboard]"
+                            : is_mouse(d)    ? " [mouse]"
+                            : "";
+            printf("  %s: %s%s\n", path, libevdev_get_name(d), tag);
             libevdev_free(d);
         }
         close(fd);
     }
 }
 
-/* Remove a dead device */
+/* Remove a dead keyboard device */
 static void remove_device(int idx) {
     fprintf(stderr, "  lost: %s\n", devices[idx].name);
     if (devices[idx].dev) {
@@ -258,7 +308,6 @@ static void remove_device(int idx) {
         libevdev_free(devices[idx].dev);
     }
     if (devices[idx].fd >= 0) close(devices[idx].fd);
-    /* Shift remaining devices down */
     for (int j = idx; j < device_count - 1; j++)
         devices[j] = devices[j + 1];
     device_count--;
@@ -266,17 +315,48 @@ static void remove_device(int idx) {
     devices[device_count].fd = -1;
 }
 
-/* Check if we already grabbed a device at this path */
+/* Remove a dead mouse device */
+static void remove_mouse(int idx) {
+    fprintf(stderr, "  lost mouse: %s\n", mice[idx].name);
+    if (mice[idx].dev) {
+        libevdev_grab(mice[idx].dev, LIBEVDEV_UNGRAB);
+        libevdev_free(mice[idx].dev);
+    }
+    if (mice[idx].fd >= 0) close(mice[idx].fd);
+    for (int j = idx; j < mouse_count - 1; j++)
+        mice[j] = mice[j + 1];
+    mouse_count--;
+    memset(&mice[mouse_count], 0, sizeof(mice[0]));
+    mice[mouse_count].fd = -1;
+}
+
+/* Check if we already grabbed a device at this path (keyboard or mouse) */
 static int already_grabbed(int event_num) {
     char path[64];
     snprintf(path, sizeof(path), "/dev/input/event%d", event_num);
+    struct stat st2;
+    if (stat(path, &st2) < 0) return 0;
     for (int i = 0; i < device_count; i++) {
-        /* Compare by fd's device/inode via path */
-        struct stat st1, st2;
-        if (fstat(devices[i].fd, &st1) == 0 && stat(path, &st2) == 0)
+        struct stat st1;
+        if (fstat(devices[i].fd, &st1) == 0)
             if (st1.st_dev == st2.st_dev && st1.st_ino == st2.st_ino)
                 return 1;
     }
+    for (int i = 0; i < mouse_count; i++) {
+        struct stat st1;
+        if (fstat(mice[i].fd, &st1) == 0)
+            if (st1.st_dev == st2.st_dev && st1.st_ino == st2.st_ino)
+                return 1;
+    }
+    return 0;
+}
+
+/* Skip our own virtual devices during scan */
+static int is_own_device(const char *path) {
+    struct stat st;
+    if (stat(path, &st) < 0) return 0;
+    if (uinput_devnum && st.st_rdev == uinput_devnum) return 1;
+    if (umouse_devnum && st.st_rdev == umouse_devnum) return 1;
     return 0;
 }
 
@@ -287,13 +367,7 @@ static int grab_keyboards(void) {
         if (already_grabbed(i)) continue;
 
         snprintf(path, sizeof(path), "/dev/input/event%d", i);
-
-        /* Skip our own virtual device */
-        if (uinput_devnum) {
-            struct stat st;
-            if (stat(path, &st) == 0 && st.st_rdev == uinput_devnum)
-                continue;
-        }
+        if (is_own_device(path)) continue;
 
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
@@ -325,6 +399,47 @@ static int grab_keyboards(void) {
     return device_count;
 }
 
+/* Scan for mice, grab any new ones. Returns total mouse count. */
+static int grab_mice(void) {
+    char path[64];
+    for (int i = 0; i < 64 && mouse_count < MAX_DEVICES; i++) {
+        if (already_grabbed(i)) continue;
+
+        snprintf(path, sizeof(path), "/dev/input/event%d", i);
+        if (is_own_device(path)) continue;
+
+        int fd = open(path, O_RDONLY | O_NONBLOCK);
+        if (fd < 0) continue;
+
+        struct libevdev *d = NULL;
+        if (libevdev_new_from_fd(fd, &d) < 0) { close(fd); continue; }
+
+        if (!is_mouse(d)) {
+            libevdev_free(d);
+            close(fd);
+            continue;
+        }
+
+        int rc = libevdev_grab(d, LIBEVDEV_GRAB);
+        if (rc < 0) {
+            fprintf(stderr, "  skip mouse %s (grab failed)\n",
+                    libevdev_get_name(d));
+            libevdev_free(d);
+            close(fd);
+            continue;
+        }
+
+        const char *name = libevdev_get_name(d);
+        mice[mouse_count].dev = d;
+        mice[mouse_count].fd = fd;
+        snprintf(mice[mouse_count].name, 128, "%s", name ? name : "?");
+        fprintf(stderr, "  grabbed mouse: %s (%s)\n",
+                mice[mouse_count].name, path);
+        mouse_count++;
+    }
+    return mouse_count;
+}
+
 /* ---- Socket ---- */
 
 static int setup_socket(const char *path) {
@@ -351,8 +466,10 @@ static void process_command(char *line) {
     if (strncmp(line, "EM ", 3) == 0) {
         int code, value;
         if (sscanf(line + 3, "%d %d", &code, &value) == 2) {
-            libevdev_uinput_write_event(uidev, EV_KEY, code, value);
-            libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
+            struct libevdev_uinput *target =
+                (code >= BTN_MISC && umouse) ? umouse : uidev;
+            libevdev_uinput_write_event(target, EV_KEY, code, value);
+            libevdev_uinput_write_event(target, EV_SYN, SYN_REPORT, 0);
         }
     } else if (strncmp(line, "BIND ", 5) == 0) {
         int mod_mask, keycode;
@@ -430,6 +547,10 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Grabbed %d keyboard(s)\n", device_count);
 
+    fprintf(stderr, "Scanning mice...\n");
+    grab_mice();
+    fprintf(stderr, "Grabbed %d mouse/mice\n", mouse_count);
+
     /* Give the virtual keyboard a recognisable name so is_keyboard()
      * can skip it during rescan.  libevdev_uinput_create_from_device
      * copies the source device's input_id (including bus type), so
@@ -480,6 +601,24 @@ int main(int argc, char **argv) {
     { struct stat st;
       if (stat(vdev, &st) == 0) uinput_devnum = st.st_rdev; }
 
+    /* Create virtual mouse from first grabbed mouse (if any) */
+    if (mouse_count > 0) {
+        const char *morig = libevdev_get_name(mice[0].dev);
+        libevdev_set_name(mice[0].dev, VMOUSE_NAME);
+        rc = libevdev_uinput_create_from_device(
+            mice[0].dev, LIBEVDEV_UINPUT_OPEN_MANAGED, &umouse);
+        if (morig)
+            libevdev_set_name(mice[0].dev, morig);
+        if (rc < 0) {
+            fprintf(stderr, "mouse uinput: %s (non-fatal)\n", strerror(-rc));
+        } else {
+            const char *mdev = libevdev_uinput_get_devnode(umouse);
+            fprintf(stderr, "Virtual mouse: %s\n", mdev);
+            struct stat st;
+            if (stat(mdev, &st) == 0) umouse_devnum = st.st_rdev;
+        }
+    }
+
     /* Clear stale modifiers */
     static const int mods[] = { KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT,
         KEY_RIGHTSHIFT, KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTMETA, KEY_RIGHTMETA };
@@ -504,13 +643,18 @@ int main(int argc, char **argv) {
     while (running) {
         if (timeout_sec > 0 && (time(NULL) - start) >= timeout_sec) break;
 
-        /* Build poll set: keyboards + listen + client + inotify */
-        struct pollfd pfds[MAX_DEVICES + 3];
+        /* Build poll set: keyboards + mice + listen + client + inotify */
+        struct pollfd pfds[MAX_DEVICES * 2 + 3];
         int nfds = 0;
 
         for (int i = 0; i < device_count; i++)
             pfds[nfds++] = (struct pollfd){
                 .fd = devices[i].fd, .events = POLLIN };
+
+        int mouse_base = nfds;
+        for (int i = 0; i < mouse_count; i++)
+            pfds[nfds++] = (struct pollfd){
+                .fd = mice[i].fd, .events = POLLIN };
 
         int listen_idx = nfds;
         pfds[nfds++] = (struct pollfd){ .fd = listen_fd, .events = POLLIN };
@@ -538,10 +682,13 @@ int main(int argc, char **argv) {
             char ibuf[4096];
             while (read(inotify_fd, ibuf, sizeof(ibuf)) > 0) {}
             usleep(200000); /* 200ms for udev */
-            int before = device_count;
+            int before_kbd = device_count, before_mouse = mouse_count;
             grab_keyboards();
-            if (device_count > before)
+            grab_mice();
+            if (device_count > before_kbd)
                 fprintf(stderr, "Now %d keyboard(s)\n", device_count);
+            if (mouse_count > before_mouse)
+                fprintf(stderr, "Now %d mouse/mice\n", mouse_count);
         }
 
         /* Accept connection */
@@ -651,6 +798,79 @@ int main(int argc, char **argv) {
                     libevdev_uinput_write_event(
                         uidev, ev.type, ev.code, ev.value);
                 }
+            } while (rc == 0);
+        }
+
+        /* Mouse events from ALL mice */
+        for (int m = 0; m < mouse_count; m++) {
+            int pidx = mouse_base + m;
+            if (pfds[pidx].revents & (POLLHUP | POLLERR)) {
+                remove_mouse(m);
+                m--;
+                continue;
+            }
+            if (!(pfds[pidx].revents & POLLIN)) continue;
+
+            do {
+                rc = libevdev_next_event(mice[m].dev,
+                                         LIBEVDEV_READ_FLAG_NORMAL, &ev);
+                if (rc == LIBEVDEV_READ_STATUS_SYNC) {
+                    while (rc == LIBEVDEV_READ_STATUS_SYNC) {
+                        if (ev.type == EV_KEY
+                            && ev.code >= BTN_MISC
+                            && (ev.value == 0 || ev.value == 1)) {
+                            if (!((ev.value == 1 && key_state[ev.code]) ||
+                                  (ev.value == 0 && !key_state[ev.code]))) {
+                                key_state[ev.code] = (ev.value == 1);
+                                if (client_fd >= 0)
+                                    fp_route_key(ev.code, ev.value);
+                                else if (umouse)
+                                    fp_emit(ev.code, ev.value);
+                            }
+                        } else if (umouse) {
+                            libevdev_uinput_write_event(
+                                umouse, ev.type, ev.code, ev.value);
+                        }
+                        rc = libevdev_next_event(mice[m].dev,
+                                                 LIBEVDEV_READ_FLAG_SYNC, &ev);
+                    }
+                    continue;
+                }
+                if (rc < 0 && rc != -EAGAIN) {
+                    remove_mouse(m);
+                    m--;
+                    break;
+                }
+                if (rc < 0) break;
+
+                /* Button events: route through remap pipeline */
+                if (ev.type == EV_KEY
+                    && ev.code >= BTN_MISC
+                    && (ev.value == 0 || ev.value == 1)) {
+                    /* De-duplicate across multiple mice */
+                    if (ev.value == 1 && key_state[ev.code]) continue;
+                    if (ev.value == 0 && !key_state[ev.code]) continue;
+                    key_state[ev.code] = (ev.value == 1);
+
+                    if (debug)
+                        fprintf(stderr, "  mouse%d: btn %d %s -> %s\n",
+                                m, ev.code, ev.value ? "DN" : "UP",
+                                (client_fd < 0) ? "passthru" :
+                                (fp_active ? "fastpath" : "client"));
+
+                    if (client_fd >= 0) {
+                        fp_route_key(ev.code, ev.value);
+                    } else if (umouse) {
+                        fp_emit(ev.code, ev.value);
+                    }
+                    continue;
+                }
+
+                /* Non-button events (motion, scroll, sync):
+                 * always forward directly through virtual mouse */
+                if (umouse)
+                    libevdev_uinput_write_event(
+                        umouse, ev.type, ev.code, ev.value);
             } while (rc == 0);
         }
     }

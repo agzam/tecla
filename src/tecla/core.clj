@@ -69,18 +69,24 @@
                     value))))
             keymap))))
 
+(defn- find-app-local
+  "Case-insensitive lookup in :app-local-keymap for `app-class` string.
+   Returns the matching keymap value or nil."
+  [config app-class]
+  (when app-class
+    (let [lc (str/lower-case app-class)]
+      (some (fn [[k v]]
+              (when (= (str/lower-case (name k)) lc)
+                v))
+            (:app-local-keymap config)))))
+
 (defn- effective-keymap
   "Get the effective keymap: app-local merged on top of global.
    When a focused app matches a key in :app-local-keymap, those
    bindings override the global ones."
   [config]
   (let [global (:global-keymap config)
-        app-class (some-> @focused-app str/lower-case)
-        local (when app-class
-                (some (fn [[k v]]
-                        (when (= (str/lower-case (name k)) app-class)
-                          v))
-                      (:app-local-keymap config)))]
+        local (find-app-local config @focused-app)]
     (if local
       (merge global local)
       global)))
@@ -496,9 +502,8 @@
         config (:config @fsm-state)]
     (reset! focused-app app-class)
     (when (and config (not= :modal (:mode @fsm-state)))
-      (let [lk (fn [c] (some-> c str/lower-case keyword))
-            prev-local (get-in config [:app-local-keymap (lk prev)])
-            curr-local (get-in config [:app-local-keymap (lk app-class)])]
+      (let [prev-local (find-app-local config prev)
+            curr-local (find-app-local config app-class)]
         (when (or prev-local curr-local)
           (let [keymap (effective-keymap config)]
             (swap! kbd-state assoc :buffer-mods (compute-buffer-mods keymap))
@@ -574,10 +579,17 @@
 
     (bridge/start-bridge! {:socket-path socket-path})
     (bridge/connect! on-key-event :socket-path socket-path)
-    (send-keymap-bindings! (effective-keymap config))
 
     (hud/start! fsm-state fsm/current-menu)
     (wm/start-focus-listener! on-focus-change!)
+
+    ;; Seed initial focused app so app-local bindings are active
+    ;; from the start (Hyprland socket2 only sends change events)
+    (when-let [w (try (wm/focused-window) (catch Exception _ nil))]
+      (on-focus-change! (:class w)))
+
+    ;; Send bindings (now includes app-local if applicable)
+    (send-keymap-bindings! (effective-keymap config))
 
     (let [srv (try (nrepl/start-server! {:host "127.0.0.1" :port nrepl-port})
                    (catch java.net.BindException _

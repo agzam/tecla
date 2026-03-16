@@ -183,7 +183,7 @@
   (let [msg (last-sent)]
     (assert= true (str/starts-with? msg "{") "starts with {")
     (assert= true (str/includes? msg "\"show\":true") "has show:true")
-    (assert= true (str/includes? msg "\"name\":\"Main\"") "has name")
+    (assert= true (str/includes? msg "\"path\":[\"Main\"]") "has path")
     (assert= true (str/includes? msg "\"keys\":[") "has keys array"))
   (tap KEY_ESC)
   (Thread/sleep 200))
