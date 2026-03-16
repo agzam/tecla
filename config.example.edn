@@ -76,9 +76,12 @@
                :slash {:desc "Search" :action (media/music-app-press-key :slash :remain? true)}
                :space {:desc "playerctl" :action "playerctl play-pause"}}}}}}
 
- ;; --- Per-app overrides (merged on top of global-keymap) ---
+   ;; --- Per-app overrides (merged on top of global-keymap) ---
+   ;; Keys can be keywords (exact match) or strings (regex pattern).
+   ;; When multiple entries match, they are merged (keyword > string).
  :app-local-keymap
- {:brave-browser
+ {;; Shared browser bindings (string key = regex pattern)
+  "brave-browser|firefox"
   {[:ctrl :n] [:down]
    [:ctrl :p] [:up]
    [:super :l] [:ctrl :l]
@@ -86,9 +89,8 @@
    [:super :k] [:ctrl :tab]
    [:super :t] [:ctrl :t]
    [:super :shift :t] [:ctrl :shift :t]
-    ;; Mac-like Cmd+Click -> Ctrl+Click (open link in new tab)
+   ;; Mac-like Cmd+Click &  Cmd+Shift+Click
    [:super :mouse-left] [:ctrl :mouse-left]
-   ;; Cmd+Shift+Click -> Ctrl+Shift+Click (open in new background tab)
    [:super :shift :mouse-left] [:ctrl :shift :mouse-left]}
 
   :kitty

@@ -61,10 +61,14 @@
             :x {:desc "Execute" :action "echo exec"}}}}
 
    :app-local-keymap
-   {:brave-browser
+   {;; string key = regex pattern, matches both brave and firefox
+    "brave-browser|firefox"
     {[:ctrl :n] [:down]
      [:ctrl :p] [:up]
-     [:super :l] [:ctrl :l]}}})
+     [:super :l] [:ctrl :l]}
+    ;; keyword key = exact match, brave-specific override
+    :brave-browser
+    {[:ctrl :p] [:pageup]}}})
 
 (defn reset-state! []
   (reset! core/fsm-state (fsm/init config))
@@ -302,14 +306,17 @@
 
 ;; ---- App-local keymap tests ----
 
-(def KEY_N 49) (def KEY_P 25) (def KEY_L 38) (def KEY_DOWN 108) (def KEY_UP 103)
+(def KEY_N 49) (def KEY_P 25) (def KEY_L 38)
+(def KEY_DOWN 108) (def KEY_UP 103) (def KEY_PAGEUP 104)
 
 (deftest "app-local: effective-keymap merges when focused on brave"
   (reset-state!)
   (reset! core/focused-app "brave-browser")
   (let [keymap (#'core/effective-keymap config)]
-    ;; App-local entry exists
+    ;; Pattern entry: ctrl+n -> down
     (assert= [:down] (get keymap [:ctrl :n]) "ctrl+n -> down")
+    ;; Keyword entry overrides pattern: ctrl+p -> pageup (not up)
+    (assert= [:pageup] (get keymap [:ctrl :p]) "ctrl+p -> pageup (kw wins)")
     ;; Global entry preserved
     (assert= [:ctrl :c] (get keymap [:super :c]) "super+c -> ctrl+c")))
 
@@ -319,18 +326,33 @@
   (let [keymap (#'core/effective-keymap config)]
     (assert= nil (get keymap [:ctrl :n]) "no ctrl+n in global")))
 
-(deftest "app-local: case-insensitive matching"
+(deftest "app-local: string key matches as regex pattern"
   (reset-state!)
-  (reset! core/focused-app "Brave-browser")
-  (let [keymap (#'core/effective-keymap config)]
-    (assert= [:down] (get keymap [:ctrl :n]) "case-insensitive match")))
+  ;; Pattern "brave-browser|firefox" should match both
+  (assert= true (some? (#'core/find-app-local config "brave-browser")) "brave")
+  (assert= true (some? (#'core/find-app-local config "firefox")) "firefox")
+  (assert= nil (#'core/find-app-local config "chromium") "no match"))
 
-(deftest "app-local: find-app-local works"
+(deftest "app-local: keyword match is case-insensitive"
   (reset-state!)
-  (assert= true (some? (#'core/find-app-local config "brave-browser")) "lowercase")
   (assert= true (some? (#'core/find-app-local config "Brave-browser")) "mixed-case")
-  (assert= true (some? (#'core/find-app-local config "BRAVE-BROWSER")) "uppercase")
-  (assert= nil (#'core/find-app-local config "firefox") "no match"))
+  (assert= true (some? (#'core/find-app-local config "BRAVE-BROWSER")) "uppercase"))
+
+(deftest "app-local: keyword overrides pattern on merge"
+  (reset-state!)
+  (let [merged (#'core/find-app-local config "brave-browser")]
+    ;; Pattern provides ctrl+n, ctrl+p, super+l
+    (assert= [:down] (get merged [:ctrl :n]) "from pattern")
+    (assert= [:ctrl :l] (get merged [:super :l]) "from pattern")
+    ;; Keyword overrides ctrl+p
+    (assert= [:pageup] (get merged [:ctrl :p]) "kw overrides pattern")))
+
+(deftest "app-local: pattern-only match (no keyword entry)"
+  (reset-state!)
+  (let [merged (#'core/find-app-local config "firefox")]
+    ;; Firefox matches pattern only, no keyword entry
+    (assert= [:down] (get merged [:ctrl :n]) "ctrl+n from pattern")
+    (assert= [:up] (get merged [:ctrl :p]) "ctrl+p from pattern (no override)")))
 
 (deftest "app-local: Ctrl+N -> Down in brave"
   (reset-state-with-app! "brave-browser")
@@ -340,11 +362,11 @@
   (assert= true (not-emitted? KEY_N 1) "N not emitted")
   (assert= true (not-emitted? CTRL 1) "Ctrl not emitted"))
 
-(deftest "app-local: Ctrl+P -> Up in brave"
-  (reset-state-with-app! "brave-browser")
-  (combo CTRL KEY_P)
-  (assert= true (emitted? KEY_UP 1) "Up press")
-  (assert= true (emitted? KEY_UP 0) "Up release"))
+(deftest "app-local: Ctrl+N -> Down in firefox via pattern"
+  (reset-state-with-app! "firefox")
+  (combo CTRL KEY_N)
+  (assert= true (emitted? KEY_DOWN 1) "Down press")
+  (assert= true (not-emitted? KEY_N 1) "N not emitted"))
 
 (deftest "app-local: global remap still works in brave"
   (reset-state-with-app! "brave-browser")
@@ -352,7 +374,7 @@
   (assert= true (emitted? CTRL 1) "Ctrl")
   (assert= true (not-emitted? SUPER 1) "no Super"))
 
-(deftest "app-local: Ctrl+N passes through when not on brave"
+(deftest "app-local: Ctrl+N passes through when not matched"
   (reset-state!)
   (reset! core/focused-app "kitty")
   (let [keymap (#'core/effective-keymap config)]

@@ -70,15 +70,28 @@
             keymap))))
 
 (defn- find-app-local
-  "Case-insensitive lookup in :app-local-keymap for `app-class` string.
-   Returns the matching keymap value or nil."
+  "Lookup in :app-local-keymap for `app-class` string.
+   Keys can be keywords (case-insensitive exact match) or strings
+   (treated as regex patterns). When multiple entries match, they are
+   merged in config order with keyword matches taking priority.
+   Example: {\"brave|firefox\" {shared...} :brave-browser {specific...}}"
   [config app-class]
   (when app-class
-    (let [lc (str/lower-case app-class)]
-      (some (fn [[k v]]
-              (when (= (str/lower-case (name k)) lc)
-                v))
-            (:app-local-keymap config)))))
+    (let [lc (str/lower-case app-class)
+          entries (:app-local-keymap config)
+          pattern-matches (keep (fn [[k v]]
+                                  (when (string? k)
+                                    (when (re-find (re-pattern k) lc) v)))
+                                entries)
+          kw-match (some (fn [[k v]]
+                           (when (and (keyword? k)
+                                      (= (str/lower-case (name k)) lc))
+                             v))
+                         entries)
+          matches (cond-> (vec pattern-matches)
+                    kw-match (conj kw-match))]
+      (when (seq matches)
+        (apply merge matches)))))
 
 (defn- effective-keymap
   "Get the effective keymap: app-local merged on top of global.
