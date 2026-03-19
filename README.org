@@ -1,0 +1,181 @@
+#+title: Tecla - Modal Keyboard Toolkit for Linux (Wayland)
+
+[[https://github.com/agzam/tecla/actions/workflows/test.yml][https://github.com/agzam/tecla/actions/workflows/test.yml/badge.svg]]
+
+#+begin_quote
+/tecla/ (Spanish) - key; /teclado/ - keyboard
+#+end_quote
+
+Status: Experimental. Fresh out of oven - expect weirdness.
+
+** Rationale
+
+Keyboard-oriented workflows are often far more efficient and less frustrating than similar mouse-driven techniques. The typical strategy is to use a multitude of keyboard shortcuts. Obviously, that approach is not very scalable. You start adding keyboard shortcuts for various actions - soon you will be blocked by conflicting shortcuts.
+
+Command composability idea of ~Vim~, although does require some initial learning and getting used to, allows you to expand your keyboard-oriented workflow with a minimal effort to memorize keys. There's so much you can do with the home-row keys (~h/j/k/l~) alone.
+
+However, that "one-dimensional" approach used in vanilla Vim/Neovim, where a single modal (Normal/Insert/Selection modes) is used, has limitations. Fortunately, the basic idea of modality can be expanded further. The [[http://spacemacs.org/][Spacemacs]] project is an excellent example of where that was done. In Spacemacs|[[https://github.com/doomemacs/doomemacs][Doom]] there is a single primary "modifier" key - ~SPACE~. To trigger an action, user is required to press a mnemonically recognizable combination e.g., ~SPC w m~ - to maximize current window.
+
+This idea was originally explored in [[https://github.com/agzam/spacehammer][Spacehammer]] - a macOS project built on Hammerspoon. Tecla brings the same approach to Linux. Jumping between apps, controlling windows, searching, editing text fields in Emacs - everything follows simple, mnemonic semantics. It lets you keep your fingers on the home row.
+
+** Architecture
+
+Two-process design:
+
+- *tecla-bridge* (C) - grabs all physical keyboards via evdev, creates a virtual keyboard via uinput. A dumb I/O pipe with no keyboard logic. Communicates over a Unix domain socket.
+- *tecla* (Babashka/Clojure) - receives raw key events, processes remaps, runs the modal FSM, dispatches actions. All configuration and logic lives here. Includes an nREPL server for live development.
+
+Compositor-agnostic: works on Hyprland, GNOME, Sway, and other Wayland compositors.
+
+** Installation
+
+*** Prerequisites
+
+- [[https://babashka.org/][Babashka]] (bb)
+- =libevdev-dev= (for building the bridge)
+- =wl-clipboard= (=wl-copy=, =wl-paste=)
+- A running Emacs server (for edit-with-emacs feature)
+
+*** Build and run
+
+#+begin_src bash
+git clone https://github.com/agzam/tecla.git
+cd tecla
+bb run
+#+end_src
+
+The bridge binary requires access to =/dev/uinput= and =/dev/input/event*=. Either run as root or add your user to the =input= group and set up udev rules.
+
+** Configuration
+
+All configuration lives in =~/.config/tecla/config.edn= (copied from =config.example.edn= on first run). Plain Clojure data - EDN maps, keywords, vectors.
+
+Config is hot-reloaded - save the file and changes take effect within a couple of seconds.
+
+** LEAD keybinding
+
+The main modal is activated by =Super+Space= (configurable in =config.edn=). From there, mnemonic key sequences invoke actions.
+
+** Features
+
+*** Global Remaps
+
+Mac-like keybindings on Linux - =Super+C= for copy, =Super+V= for paste, etc.:
+
+#+begin_src clojure
+{:global-keymap
+ {[:super :c] [:ctrl :c]
+  [:super :v] [:ctrl :v]
+  [:super :a] [:ctrl :a]
+  ...}}
+#+end_src
+
+*** =LEAD w= - Window management
+
+- =h/j/k/l= - focus windows directionally
+- =Shift + h/j/k/l= - move windows
+- =m= - maximize
+- =c= - close window
+- =f= - toggle floating
+- =s= - pin (always on top)
+- =o= - move to other monitor
+- =r= - enter resize mode (transient: =h/l= width, =j/k= height)
+
+*** =LEAD a= - Apps (quick jump)
+
+- =e= - Emacs
+- =i= - Kitty
+- =b= - Brave
+- =s= - Slack
+
+Uses =wm/focus-or-launch= - focuses the app if running, launches it otherwise.
+
+*** =LEAD m= - Media controls
+
+- =j/k= - volume down/up
+- =m= - mute toggle
+- =s= - play/pause
+- =h/l= - previous/next track
+
+*** Edit with Emacs
+
+Edit any text field on the system using Emacs. Default binding: =Super+Ctrl+O=.
+
+1. Tecla copies the focused field's text (=Ctrl+C= or =Ctrl+A, Ctrl+C=)
+2. Opens an Emacs buffer with the captured text
+3. Edit freely, then:
+   - =C-c C-c= - paste text back to the app, close buffer
+   - =C-c C-s= - sync text to the app, keep editing
+   - =C-c C-k= - cancel, return to app without changes
+
+Requires a running Emacs server (=M-x server-start=). The Elisp package (=tecla.el=) is auto-loaded on first invocation.
+
+See [[docs/edit-with-emacs-spec.org][full spec]] for details.
+
+*** Per-app Keymaps
+
+Override bindings for specific apps:
+
+#+begin_src clojure
+:app-local-keymap
+{:kitty
+ {[:super :c] [:ctrl :shift :c]
+  [:super :v] [:ctrl :shift :v]}
+ :brave-browser
+ {[:super :l] [:ctrl :l]
+  [:super :j] [:ctrl :shift :tab]
+  [:super :k] [:ctrl :tab]}}
+#+end_src
+
+Pattern-based matching is also supported - use strings as regex keys:
+
+#+begin_src clojure
+{"brave|firefox" {[:super :l] [:ctrl :l]}}
+#+end_src
+
+*** Which-key HUD
+
+A GTK4 overlay shows available keys and descriptions when you enter a modal menu. Uses =gtk4-layer-shell= on wlroots compositors.
+
+*** Shell Commands
+
+Bind any key combo to a shell command:
+
+#+begin_src clojure
+[:super :ctrl :p] "cliphist list | wofi --dmenu | cliphist decode | wl-copy"
+[:super :ctrl :5] "flameshot gui"
+#+end_src
+
+*** Clojure Functions
+
+Bind to arbitrary Clojure functions with namespace-qualified forms:
+
+#+begin_src clojure
+[:super :ctrl :o] (emacs/edit-with-emacs)
+:e {:desc "Emacs" :action (wm/focus-or-launch {:class "Emacs"})}
+#+end_src
+
+Short aliases: =wm/= -> =tecla.wm/=, =media/= -> =tecla.media/=, =emacs/= -> =tecla.emacs/=.
+
+** Live Development
+
+Tecla runs an nREPL server (default port 7890). Connect from Emacs/CIDER and modify keymaps, test actions, or reload config at runtime:
+
+#+begin_src clojure
+;; From a connected REPL
+(tecla.core/reload-config! (tecla.core/default-config-path))
+(tecla.wm/focus-or-launch {:class "kitty"})
+#+end_src
+
+** Customizing
+
+User code can be placed in =~/.config/tecla/src/= - this directory is automatically added to the classpath.
+
+** Acknowledgments
+
+Tecla is the Linux successor of [[https://github.com/agzam/spacehammer][Spacehammer]], which pioneered this approach on macOS using Hammerspoon. The edit-with-emacs feature, modal menu design, and overall philosophy are directly inherited from that project.
+
+** Copyright & Licence
+
+Copyright - Ag Ibragimov.
+[[LICENSE][GNU General Public License]]

@@ -1,13 +1,12 @@
 ;;; tecla.el --- Tecla Elisp Helpers -*- lexical-binding: t; -*-
 ;;
-;; Copyright (C) 2025 Ag Ibragimov
+;; Copyright (C) 2026 Ag Ibragimov
 ;;
 ;; Author: Ag Ibragimov <agzam.ibragimov@gmail.com>
-;; Maintainer: Ag Ibragimov <agzam.ibragimov@gmail.com>
 ;; Version: 0.1.0
 ;; Keywords: extensions tools
 ;; Homepage: https://github.com/agzam/tecla
-;; Package-Requires: ((emacs "27"))
+;; Package-Requires: ((emacs "29"))
 ;;
 ;; This file is not part of GNU Emacs.
 ;;
