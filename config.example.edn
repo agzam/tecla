@@ -15,6 +15,9 @@
   [:super :ctrl :p] "cliphist list | wofi --dmenu | cliphist decode | wl-copy"
   [:super :ctrl :5] "flameshot gui"
 
+  ;; --- Edit with Emacs ---
+  [:super :ctrl :o] (emacs/edit-with-emacs)
+
   ;; --- Modal ---
   [:super :space]
   {:desc "Main"

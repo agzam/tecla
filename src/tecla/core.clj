@@ -126,7 +126,8 @@
 (def ^:private form-aliases
   "Short namespace aliases for config EDN forms."
   {"wm" "tecla.wm"
-   "media" "tecla.media"})
+   "media" "tecla.media"
+   "emacs" "tecla.emacs"})
 
 (defn- expand-sym
   "Expand short aliases: wm/focus-left -> tecla.wm/focus-left"

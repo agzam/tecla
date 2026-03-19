@@ -2,6 +2,17 @@
 
 * Unreleased
 
+** Edit-with-Emacs
+- =Super+Ctrl+O= opens any text field in an Emacs buffer for editing
+- Clipboard-based capture via =wl-copy --clear= sentinel + =wl-paste= polling
+- Captured text passed directly to Emacs (no =clipboard-yank= race)
+- Write-back via =Ctrl+V= (selection) or =Ctrl+A, Ctrl+V= (full text)
+- Emacs minor mode: =C-c C-c= finish, =C-c C-s= sync, =C-c C-k= cancel
+- IPC from Emacs to Tecla via existing nREPL server (bencode)
+- =tecla.el= auto-loaded by =emacsclient -e= on first invocation
+- Hooks for buffer lifecycle (set major mode per app, etc.)
+- Spec: =docs/edit-with-emacs-spec.org=
+
 ** Bridge
 - Replace blocking 3-second device rescan with inotify on /dev/input
 - Disable kernel autorepeat on virtual keyboard (EVIOCSREP)

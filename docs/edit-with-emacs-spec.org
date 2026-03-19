@@ -1,0 +1,253 @@
+#+TITLE: Edit-with-Emacs Specification (Tecla/Linux)
+#+AUTHOR: Ag Ibragimov
+#+STARTUP: showall
+
+* Overview
+
+Edit-with-Emacs (EWE) lets you edit any text field on the system using
+Emacs. Triggered via =Super+Ctrl+O=, it copies the focused app's text,
+opens an Emacs buffer, and writes edited text back on finish.
+
+** Architecture
+
+Two-process system:
+
+- Tecla (Babashka/Clojure) :: captures the text, manages sessions,
+  handles write-back. Runs the evdev/uinput bridge for synthetic
+  keystrokes. Exposes session functions via its nREPL server.
+
+- Emacs :: provides the editing buffer. Communicates back to Tecla
+  by sending bencode nREPL eval requests to Tecla's nREPL port.
+
+Files:
+- =src/tecla/emacs.clj= - Tecla side
+- =tecla.el= - Emacs side (auto-loaded via =emacsclient -e=)
+
+* Lifecycle
+
+** 1. Invocation
+
+| Trigger        | =Super+Ctrl+O= (global keymap binding)              |
+| Config entry   | =[:super :ctrl :o] (emacs/edit-with-emacs)=          |
+| Dispatch       | =core/dispatch-form!= resolves =emacs/edit-with-emacs= |
+| Thread         | Runs in a =future= (blocking clipboard ops are fine) |
+
+** 2. Text Capture (Tecla side)
+
+This is the trickiest part on Linux.
+
+*** Clipboard model (Wayland only)
+
+The clipboard works on a producer-consumer basis: the copying app
+becomes the "data source" and serves content on demand. =wl-copy=
+sets the source, =wl-paste= requests from it. Key facts:
+
+- No =changeCount= integer like macOS pasteboard - there is no
+  atomic way to detect "did the clipboard just change?"
+- Solution: clear clipboard (=wl-copy --clear=) before sending
+  Ctrl+C, then poll =wl-paste= for non-empty content
+- Clipboard content persists across focus changes (unlike PRIMARY
+  selection, which is focus-dependent)
+- Some apps (terminals) use =Ctrl+Shift+C= instead of =Ctrl+C=
+
+*** Capture flow
+
+#+begin_src
+1. Record focused window info (class, title, address) via WM
+2. Clear clipboard via `wl-copy --clear`
+3. Send Ctrl+C via bridge
+4. Poll `wl-paste` until non-empty content appears
+   - If content appears -> selection was copied
+   - If timeout (~1s) -> no selection was active
+5. On timeout, clear again, try Ctrl+A then Ctrl+C, poll again
+6. On second timeout -> abort with log message, no buffer opened
+7. Pass captured text to Emacs as a string argument to
+   tecla-edit-with-emacs (not via clipboard-yank)
+#+end_src
+
+*** TODO [1/4] Capture checklist
+
+- [X] Sentinel-based clipboard change detection (=wl-copy --clear=
+  then poll for non-empty) instead of content comparison
+- [X] Pass captured text to Emacs as a string argument rather
+  than relying on =clipboard-yank=
+- [X] Abort gracefully when capture fails (log message, no
+  empty buffer opened with stale clipboard)
+- [ ] Handle terminal apps (=Ctrl+Shift+C= for kitty, etc.)
+  via per-app copy/paste key config
+
+** 3. Buffer Creation (Emacs side)
+
+=emacsclient -e= evaluates:
+#+begin_src elisp
+(progn
+ (add-to-list 'load-path "<tecla-dir>")
+ (require 'tecla)
+ (tecla-edit-with-emacs CLASS TITLE SESSION-ID SELECTION-ONLY TEXT))
+#+end_src
+
+The function:
+1. Creates buffer =*tecla-edit TITLE [SESSION-ID]*=
+2. Inserts TEXT (passed as argument, not from clipboard)
+3. Sets buffer-local session variables (=permanent-local=)
+4. Enables =tecla-edit-with-emacs-mode= minor mode
+5. Runs =tecla-edit-with-emacs-hook= (for major-mode setting, etc.)
+6. Sets header-line showing keybindings and caller info
+
+** 4. Editing
+
+User edits freely. Available commands:
+
+| Key       | Command                          | Effect                        |
+|-----------+----------------------------------+-------------------------------|
+| =C-c C-c= | =tecla-finish-edit-with-emacs=   | Write back, close buffer      |
+| =C-c C-s= | =tecla-sync-edit-with-emacs=     | Write back, keep editing      |
+| =C-c C-k= | =tecla-cancel-edit-with-emacs=   | Discard, return to app        |
+
+** 5. Write-back (Tecla side)
+
+All write-back uses clipboard mode:
+
+1. =clipboard-set= the edited text (=wl-copy= / =xclip=)
+2. Focus the originating app window (by address or class)
+3. Wait briefly for focus
+4. Emit paste keystroke:
+   - Selection session: =Ctrl+V= (replaces selection)
+   - Full-text session: =Ctrl+A= then =Ctrl+V= (select all, replace)
+5. For sync: wait, then re-focus Emacs
+6. For finish: clean up session, stay in the app
+
+*** TODO [0/3] Write-back checklist
+
+- [ ] Per-app paste keys (terminals need =Ctrl+Shift+V=)
+- [ ] Verify focus landed on the right window before pasting
+- [ ] Restore original clipboard content after paste (clipboard
+  safety net)
+
+** 6. Cancellation
+
+=cancel-session=: focus the originating app, discard session. No
+clipboard modification, no pasting.
+
+* Session State
+
+Each invocation creates a session stored in =tecla.emacs/sessions= atom:
+
+| Field            | Type    | Description                              |
+|------------------+---------+------------------------------------------|
+| =:class=         | string  | Window class (e.g. "brave-browser")      |
+| =:title=         | string  | Window title                             |
+| =:address=       | string  | Hyprland window address (for refocusing) |
+| =:has-selection= | boolean | True if only selected text was captured   |
+| =:original=      | string  | The original captured text               |
+
+Emacs buffer-local variables (=permanent-local= to survive major-mode
+changes):
+
+| Variable                   | Description                              |
+|----------------------------+------------------------------------------|
+| =tecla--session-id=        | Links buffer to Tecla session            |
+| =tecla--caller-class=      | Window class of originating app          |
+| =tecla--caller-title=      | Window title                             |
+| =tecla--selection-only=    | Non-nil if editing a selection           |
+
+* IPC
+
+** Tecla -> Emacs
+
+=emacsclient -e= with a =(progn ...)= expression that loads =tecla.el=
+and calls =tecla-edit-with-emacs=.
+
+** Emacs -> Tecla
+
+Emacs sends nREPL =eval= requests (bencode over TCP) to Tecla's
+existing nREPL server (default port 7890). Evaluates Clojure
+expressions directly:
+
+#+begin_src clojure
+(tecla.emacs/sync-text "session-id" "edited text")
+(tecla.emacs/finish-session "session-id" "edited text")
+(tecla.emacs/cancel-session "session-id")
+#+end_src
+
+No extra server or port needed.
+
+* Per-app Configuration
+
+Some apps require different key combos for copy/paste.
+
+** Planned config format
+
+#+begin_src clojure
+:app-clipboard-keys
+{:kitty          {:copy  [:ctrl :shift :c]
+                  :paste [:ctrl :shift :v]
+                  :select-all [:ctrl :shift :a]}
+ "terminal.*"    {:copy  [:ctrl :shift :c]
+                  :paste [:ctrl :shift :v]}}
+#+end_src
+
+The =emacs.clj= module would look up the focused app class and use
+the matching keys instead of the default =Ctrl+C= / =Ctrl+V=.
+
+** TODO [0/1] Per-app checklist
+
+- [ ] Implement per-app copy/paste/select-all key lookup
+
+* Hooks (Emacs side)
+
+| Hook                                         | Args                         | When                     |
+|----------------------------------------------+------------------------------+--------------------------|
+| =tecla-edit-with-emacs-hook=                 | buf-name, class, title       | Buffer created           |
+| =tecla-before-finish-edit-with-emacs-hook=   | buf-name, class              | Before finish            |
+| =tecla-before-cancel-edit-with-emacs-hook=   | buf-name, class              | Before cancel            |
+| =tecla-after-sync-hook=                      | buf-name, session-id         | After sync               |
+
+Typical hook usage: set major mode based on app class:
+#+begin_src elisp
+(add-hook 'tecla-edit-with-emacs-hook
+          (lambda (buf class title)
+            (when (string-match-p "slack" class)
+              (markdown-mode))))
+#+end_src
+
+* Invariants
+
+1. Clipboard safety: original clipboard content should be preserved
+   when possible (restore after paste, or at minimum don't clobber
+   on cancel)
+2. Session cleanup: sessions are removed from the atom on finish
+   or cancel; Emacs buffer is killed
+3. Focus correctness: the right window must have focus before
+   pasting, otherwise text goes to the wrong place
+4. String escaping: text must survive the round-trip through
+   Clojure string literals, elisp string literals, nREPL bencode,
+   and clipboard without corruption
+5. =permanent-local= variables: survive major-mode changes
+   triggered by hooks
+
+* Known Limitations
+
+- No direct text injection (no AX equivalent on Linux) - clipboard
+  mode only, which means the user's clipboard is temporarily
+  clobbered
+- PRIMARY selection (middle-click paste) is not used
+- Terminal apps need special handling (different copy/paste keys)
+- If the originating window is closed between capture and
+  write-back, the paste will fail silently
+- Wayland PRIMARY selection (middle-click paste) is not used - only
+  the CLIPBOARD selection
+
+* Manual Test Matrix
+
+| # | Scenario                                | Expected                                         | Status |
+|---+-----------------------------------------+--------------------------------------------------+--------|
+| 1 | Super+Ctrl+O in browser text field      | Field text appears in Emacs buffer               | FAIL   |
+| 2 | Select partial text, Super+Ctrl+O       | Only selection in buffer, [selection] in header   | FAIL   |
+| 3 | C-c C-c after editing                   | Text pasted back, buffer killed, app focused     | TODO   |
+| 4 | C-c C-s to sync                         | Text pasted back, Emacs regains focus            | TODO   |
+| 5 | C-c C-k to cancel                       | App focused, no text change, buffer killed        | TODO   |
+| 6 | Super+Ctrl+O in terminal (kitty)        | Should use Ctrl+Shift+C for copy                 | TODO   |
+| 7 | Edit-with-emacs-hook sets major mode    | e.g. markdown-mode for Slack                     | TODO   |
+| 8 | Text with special chars (quotes, \n)    | Round-trips correctly                            | TODO   |
+| 9 | Rapid re-invocation (same app)          | Previous session cleaned, new one works          | TODO   |
