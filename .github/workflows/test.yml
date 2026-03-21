@@ -27,6 +27,24 @@ jobs:
       - name: Run HUD poller tests
         run: bb test/hud_test.clj
 
+      - name: Run edit-with-emacs tests
+        run: bb test/emacs_test.clj
+
+  elisp-tests:
+    name: Elisp tests (tecla.el)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Emacs
+        run: sudo apt-get update && sudo apt-get install -y emacs-nox
+
+      - name: Install Buttercup
+        run: make deps
+
+      - name: Run Buttercup tests
+        run: make test
+
   bridge-tests:
     name: Bridge integration tests
     runs-on: ubuntu-latest
