@@ -30,6 +30,7 @@
 ** Window management
 - =wm/focus-or-launch= accepts map ={:class ... :command ...}= (positional args still work)
 - Hyprland: proper JSON parsing via cheshire (fixes focus-or-launch not finding windows)
+- Hyprland: window actions work under a Lua config (0.55+), which rejects the hyprlang dispatch syntax; the syntax follows =configProvider= from =hyprctl status=
 - GNOME: updated to same map signature
 
 ** HUD

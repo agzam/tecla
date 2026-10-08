@@ -10,7 +10,7 @@
            [java.nio.charset StandardCharsets]))
 
 ;; ----------------------------------------------------------------
-;; Socket discovery (borrowed from ~/.config/hypr/hypr.clj pattern)
+;; Socket discovery
 ;; ----------------------------------------------------------------
 
 (defn- find-socket
@@ -58,31 +58,60 @@
         (println "hypr-cmd error:" (.getMessage e))
         nil))))
 
-(defn- dispatch [cmd]
-  (hypr-cmd (str "dispatch " cmd)))
+(defn- lua-str
+  "Quote s as a Lua string literal."
+  [s]
+  (str "\""
+       (-> (str s)
+           (str/replace "\\" "\\\\")
+           (str/replace "\"" "\\\"")
+           (str/replace "\n" "\\n")
+           (str/replace "\r" "\\r"))
+       "\""))
+
+(defn- lua-config?
+  "True when Hyprland runs a Lua config. Its dispatch takes Lua expressions
+   and rejects the hyprlang syntax; Hyprland without `status` is hyprlang."
+  []
+  (= "lua" (:configProvider (hypr-cmd "status"))))
+
+(defn- dispatch
+  "Send `legacy` to a hyprlang Hyprland, `lua` to a Lua-configured one."
+  [legacy lua]
+  (hypr-cmd (str "dispatch " (if (lua-config?) lua legacy))))
+
+(defn- focus-address [address]
+  (let [window (str "address:" address)]
+    (dispatch (str "focuswindow " window)
+              (format "hl.dsp.focus({window = %s})" (lua-str window)))))
 
 ;; ----------------------------------------------------------------
 ;; Register methods
 ;; ----------------------------------------------------------------
 
-(defmethod wm/action [:hyprland :focus-left]  [& _] (dispatch "movefocus l"))
-(defmethod wm/action [:hyprland :focus-right] [& _] (dispatch "movefocus r"))
-(defmethod wm/action [:hyprland :focus-up]    [& _] (dispatch "movefocus u"))
-(defmethod wm/action [:hyprland :focus-down]  [& _] (dispatch "movefocus d"))
+(defmethod wm/action [:hyprland :focus-left]  [& _] (dispatch "movefocus l" "hl.dsp.focus({direction = 'l'})"))
+(defmethod wm/action [:hyprland :focus-right] [& _] (dispatch "movefocus r" "hl.dsp.focus({direction = 'r'})"))
+(defmethod wm/action [:hyprland :focus-up]    [& _] (dispatch "movefocus u" "hl.dsp.focus({direction = 'u'})"))
+(defmethod wm/action [:hyprland :focus-down]  [& _] (dispatch "movefocus d" "hl.dsp.focus({direction = 'd'})"))
 
-(defmethod wm/action [:hyprland :move-left]   [& _] (dispatch "movewindow l"))
-(defmethod wm/action [:hyprland :move-right]  [& _] (dispatch "movewindow r"))
-(defmethod wm/action [:hyprland :move-up]     [& _] (dispatch "movewindow u"))
-(defmethod wm/action [:hyprland :move-down]   [& _] (dispatch "movewindow d"))
+(defmethod wm/action [:hyprland :move-left]   [& _] (dispatch "movewindow l" "hl.dsp.window.move({direction = 'l'})"))
+(defmethod wm/action [:hyprland :move-right]  [& _] (dispatch "movewindow r" "hl.dsp.window.move({direction = 'r'})"))
+(defmethod wm/action [:hyprland :move-up]     [& _] (dispatch "movewindow u" "hl.dsp.window.move({direction = 'u'})"))
+(defmethod wm/action [:hyprland :move-down]   [& _] (dispatch "movewindow d" "hl.dsp.window.move({direction = 'd'})"))
 
-(defmethod wm/action [:hyprland :maximize]      [& _] (dispatch "fullscreen 1"))
-(defmethod wm/action [:hyprland :close-window]  [& _] (dispatch "killactive"))
+(defmethod wm/action [:hyprland :maximize]     [& _]
+  (dispatch "fullscreen 1" "hl.dsp.window.fullscreen({mode = 'maximized'})"))
+(defmethod wm/action [:hyprland :close-window] [& _]
+  (dispatch "killactive" "hl.dsp.window.close()"))
 
-(defmethod wm/action [:hyprland :workspace-next] [& _] (dispatch "workspace e+1"))
-(defmethod wm/action [:hyprland :workspace-prev] [& _] (dispatch "workspace e-1"))
+(defmethod wm/action [:hyprland :workspace-next] [& _]
+  (dispatch "workspace e+1" "hl.dsp.focus({workspace = 'e+1'})"))
+(defmethod wm/action [:hyprland :workspace-prev] [& _]
+  (dispatch "workspace e-1" "hl.dsp.focus({workspace = 'e-1'})"))
 
 (defmethod wm/action [:hyprland :resize-active] [_ dx dy & _]
-  (dispatch (str "resizeactive " dx " " dy)))
+  (dispatch (str "resizeactive " dx " " dy)
+            (format "hl.dsp.window.resize({x = %s, y = %s, relative = true})" dx dy)))
 
 (defmethod wm/action [:hyprland :focus-or-launch] [_ opts]
   (let [{:keys [class command]} opts
@@ -100,21 +129,28 @@
                                                   (str (get % key)))))
                                %)))]
     (if matching
-      (dispatch (str "focuswindow address:" (:address matching)))
-      (dispatch (str "exec " command)))))
+      (focus-address (:address matching))
+      (dispatch (str "exec " command)
+                (format "hl.dsp.exec_cmd(%s)" (lua-str command))))))
 
-(defmethod wm/action [:hyprland :toggle-floating] [& _] (dispatch "togglefloating"))
-(defmethod wm/action [:hyprland :pin]             [& _] (dispatch "pin"))
-(defmethod wm/action [:hyprland :minimize]         [& _]
-  (dispatch "movetoworkspacesilent special:minimized"))
-(defmethod wm/action [:hyprland :move-to-monitor]  [& _]
-  (dispatch "movewindow mon:+1"))
+(defmethod wm/action [:hyprland :toggle-floating] [& _]
+  (dispatch "togglefloating" "hl.dsp.window.float({action = 'toggle'})"))
+(defmethod wm/action [:hyprland :pin]             [& _]
+  (dispatch "pin" "hl.dsp.window.pin()"))
+(defmethod wm/action [:hyprland :minimize]        [& _]
+  (dispatch "movetoworkspacesilent special:minimized"
+            "hl.dsp.window.move({workspace = 'special:minimized', follow = false})"))
+(defmethod wm/action [:hyprland :move-to-monitor] [& _]
+  (dispatch "movewindow mon:+1" "hl.dsp.window.move({monitor = '+1'})"))
 
 (defmethod wm/action [:hyprland :send-shortcut] [_ mods key window]
-  (dispatch (str "sendshortcut " mods "," key "," window)))
+  (dispatch (str "sendshortcut " mods "," key "," window)
+            (format "hl.dsp.send_shortcut({mods = %s, key = %s%s})"
+                    (lua-str mods) (lua-str key)
+                    (if (str/blank? window) "" (str ", window = " (lua-str window))))))
 
 (defmethod wm/action [:hyprland :focus-window-by-address] [_ address]
-  (dispatch (str "focuswindow address:" address)))
+  (focus-address address))
 
 (defmethod wm/action [:hyprland :focused-window] [& _]
   (when-let [w (hypr-cmd "activewindow")]

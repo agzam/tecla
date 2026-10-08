@@ -34,8 +34,14 @@
   test:emacs {:doc "Run edit-with-emacs unit tests"
               :task (shell "bb test/emacs_test.clj")}
 
+  test:hyprland {:doc "Run Hyprland dispatch unit tests"
+                 :task (shell "bb test/hyprland_test.clj")}
+
+  test:hyprland-live {:doc "Run wm actions against a nested Hyprland (needs HYPRLAND_INSTANCE_SIGNATURE of it, kitty)"
+                      :task (shell "bb test/hyprland_live.clj")}
+
   test {:doc "Run all unit tests"
-        :depends [test:fsm test:core test:emacs]}
+        :depends [test:fsm test:core test:emacs test:hyprland]}
 
   setup:gnome
   {:doc "Install the window-calls GNOME Shell extension (needed for focus-or-launch on GNOME/Wayland)"
