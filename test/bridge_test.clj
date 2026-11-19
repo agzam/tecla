@@ -1,28 +1,37 @@
 #!/usr/bin/env bb
 
-;; Integration tests for the tecla-bridge I/O pipe.
-;;
-;; The bridge grabs all keyboards, forwards EV events to a client,
-;; and emits EM commands to uinput. All keyboard logic is in BB -
-;; the bridge is just I/O.
-;;
+;; Integration tests on real evdev/uinput devices: the tecla-bridge protocol
+;; with a raw socket client, then the whole pipeline with tecla.core as the
+;; client (test keyboard -> bridge -> core -> bridge -> virtual keyboard).
 ;; Usage: bb test/bridge_test.clj
 
 (require '[babashka.process :as p]
          '[clojure.string :as str]
-         '[clojure.java.io :as io])
+         '[clojure.java.io :as io]
+         '[tecla.bridge :as bridge]
+         '[tecla.core :as core]
+         '[tecla.fsm :as fsm])
 
 (import [java.net StandardProtocolFamily UnixDomainSocketAddress]
         [java.nio.channels SocketChannel]
         [java.nio ByteBuffer]
         [java.nio.charset StandardCharsets])
 
+(def KEY_ESC 1)
 (def KEY_A 30)
 (def KEY_B 48)
+(def KEY_C 46)
+(def KEY_H 35)
 (def KEY_M 50)
+(def KEY_SPACE 57)
 (def KEY_LEFTCTRL 29)
 (def KEY_LEFTSHIFT 42)
+(def KEY_RIGHTSHIFT 54)
+(def KEY_RIGHTALT 100)
 (def KEY_LEFTMETA 125)
+(def KEY_RIGHTMETA 126)
+(def KEY_MUTE 113)          ;; not a key of tecla-test-keyboard
+(def KEY_EMOJI_PICKER 585)  ;; above the BTN_* range
 
 (def project-dir (.getCanonicalPath (io/file ".")))
 (def bridge-bin (str project-dir "/bridge/tecla-bridge"))
@@ -117,6 +126,13 @@
 (defn ev? [evts code val] (some (fn [[c v]] (and (= c code) (= v val))) evts))
 (defn no-ev? [evts code val] (not (ev? evts code val)))
 
+(defn held-on-output
+  "Keycodes left down on the bridge's virtual keyboard after `evts`."
+  [evts]
+  (reduce (fn [down [code value]]
+            (if (= 1 value) (conj down code) (disj down code)))
+          #{} evts))
+
 ;; ---- Process management ----
 
 (defn ensure-built []
@@ -125,18 +141,24 @@
       (when-not (zero? (:exit r)) (throw (ex-info "Build failed" {}))))))
 
 (defn start-test-kbd []
-  (let [proc (p/process {:out :stream :in :stream :err :inherit} test-kbd-bin)
+  (let [proc (p/process {:out :stream :in :stream :err :inherit} test-kbd-bin "--mouse")
         reader (io/reader (:out proc))
-        devnode (.readLine reader)]
-    (when (str/blank? devnode) (throw (ex-info "test-kbd: no device path" {})))
-    (println "Test keyboard:" devnode)
+        devnode (.readLine reader)
+        mouse (.readLine reader)]
+    (when (or (str/blank? devnode) (str/blank? mouse))
+      (throw (ex-info "test-kbd: no device path" {})))
+    (println "Test keyboard:" devnode "mouse:" mouse)
     (Thread/sleep 200)
-    {:proc proc :devnode devnode :reader reader}))
+    {:proc proc :devnode devnode :mouse mouse :reader reader}))
 
-(defn start-bridge [sock-path]
-  (let [proc (p/process {:out :inherit :in :inherit :err :inherit}
-                         bridge-bin "--allow-virtual"
-                         "--socket" sock-path "--timeout" "120")]
+(defn start-bridge
+  "--device keeps the bridge off every other virtual device (Espanso,
+   ydotool) when the tests run on a desktop."
+  [sock-path devices]
+  (let [proc (apply p/process {:out :inherit :in :inherit :err :inherit}
+                    bridge-bin "--allow-virtual"
+                    "--socket" sock-path "--timeout" "120"
+                    (mapcat (fn [d] ["--device" d]) devices))]
     (Thread/sleep 500) proc))
 
 (defn start-monitor [devnode]
@@ -158,7 +180,7 @@
   (ensure-built)
   (let [sp (socket-path)
         kbd (start-test-kbd)
-        bridge (start-bridge sp)
+        bridge (start-bridge sp [(:devnode kbd) (:mouse kbd)])
         ch (connect-socket sp 15)
         writer (io/writer (:in (:proc kbd)))]
     (alter-var-root #'*test-kbd* (constantly kbd))
@@ -178,8 +200,9 @@
 
 (defn teardown []
   (when *socket* (try (.close *socket*) (catch Exception _)))
-  (when *monitor* (stop-proc *monitor*))
+  ;; Bridge first: its virtual keyboard goes away while the monitor still grabs it
   (when *bridge* (stop-proc *bridge*))
+  (when *monitor* (stop-proc (:proc *monitor*)))
   (when *test-kbd*
     (try (.close (:in (:proc *test-kbd*))) (catch Exception _))
     (stop-proc (:proc *test-kbd*)))
@@ -254,12 +277,124 @@
 
   ;; -- Passthrough when no client --
   ;; (Can't easily test disconnect/reconnect in this harness, skip for now)
-  )
+
+  ;; -- Fast path: after PASSTHROUGH the bridge emits unbound keys itself --
+
+  (deftest "fast path emits an unbound key without the client"
+    (send-cmd *socket* "BIND 8 57") (send-cmd *socket* "PASSTHROUGH")
+    (Thread/sleep 50)
+    (drain *socket*) (drain-monitor)
+    (inject-tap KEY_A)
+    (let [events (read-monitor-events 300)
+          lines (read-lines-timeout *socket* 200)]
+      (assert= [[KEY_A 1] [KEY_A 0]] events "output")
+      (assert= [] lines "lines sent to the client")))
+
+  (deftest "key pressed on the fast path is released after INTERCEPT"
+    (drain-monitor)
+    (inject-key KEY_LEFTSHIFT 1) (Thread/sleep 30)
+    (send-cmd *socket* "INTERCEPT") (Thread/sleep 50)
+    (inject-key KEY_LEFTSHIFT 0)
+    (let [events (read-monitor-events 300)]
+      (send-cmd *socket* (str "EM " KEY_LEFTSHIFT " 0"))
+      (assert= [[KEY_LEFTSHIFT 1] [KEY_LEFTSHIFT 0]] events "output")))
+
+  ;; -- Virtual devices --
+
+  (deftest "EM reaches the output for a key the grabbed keyboard lacks"
+    (drain-monitor)
+    (send-cmd *socket* (str "EM " KEY_MUTE " 1"))
+    (send-cmd *socket* (str "EM " KEY_MUTE " 0"))
+    (assert= [[KEY_MUTE 1] [KEY_MUTE 0]] (read-monitor-events 300) "output"))
+
+  (deftest "bridge grabs the test mouse, whatever its event number"
+    ;; a second grab fails while the bridge holds the device
+    (let [probe (p/process {:out :string :err :string}
+                           test-monitor-bin (:mouse *test-kbd*))
+          exit (:exit (deref probe 1000 nil))]
+      (when-not exit (p/destroy probe))
+      (assert= 1 exit "exit code of a monitor on the mouse")))
+
+  (deftest "extended key code goes to the keyboard while a mouse is grabbed"
+    (drain-monitor)
+    (send-cmd *socket* (str "EM " KEY_EMOJI_PICKER " 1"))
+    (send-cmd *socket* (str "EM " KEY_EMOJI_PICKER " 0"))
+    (assert= [[KEY_EMOJI_PICKER 1] [KEY_EMOJI_PICKER 0]]
+             (read-monitor-events 300) "output")))
+
+;; ---- Pipeline: test keyboard -> bridge -> tecla.core -> bridge -> output ----
+
+(def fired (atom 0))
+
+(def pipeline-config
+  {:global-keymap
+   {[:super :c] [:ctrl :c]
+    [:alt :backspace] [:ctrl :backspace]
+    [:super :space]
+    {:desc "Main"
+     :keys {:a {:desc "Apps"
+                :keys {[:shift :b] {:desc "Brave Private"
+                                    :action (fn [] (swap! fired inc))}}}}}}})
+
+(defn pipeline-events
+  "Reset the client, type `steps` and return what reached the output. The
+   pause after each key lets the client switch the bridge between passthrough
+   and intercept. Keys still down are released, so a failure stays local."
+  [steps]
+  (reset! core/fsm-state (fsm/init pipeline-config))
+  (reset! core/kbd-state {:mod-state 0 :held-mods #{} :buffered-mods 0
+                          :consumed-mods 0 :active-sims {} :buffer-mods 0})
+  (core/update-config! identity)
+  (Thread/sleep 100)
+  (drain-monitor)
+  (doseq [[code value] steps]
+    (inject-key code value)
+    (Thread/sleep 60))
+  (let [events (read-monitor-events 300)]
+    (doseq [code (held-on-output events)] (bridge/emit! code 0))
+    events))
+
+(defn run-pipeline-tests []
+  (println "\n=== pipeline tests (bridge + tecla.core) ===\n")
+  (.close *socket*)
+  (bridge/connect! core/on-key-event :socket-path (socket-path))
+
+  (deftest "remap: Super+C comes out as Ctrl+C"
+    (assert= [[KEY_LEFTCTRL 1] [KEY_C 1] [KEY_C 0] [KEY_LEFTCTRL 0]]
+             (pipeline-events [[KEY_LEFTMETA 1] [KEY_C 1] [KEY_C 0] [KEY_LEFTMETA 0]])
+             "output"))
+
+  (deftest "Super+Space, a, right Shift+b leaves no key down"
+    (reset! fired 0)
+    (let [events (pipeline-events
+                  [[KEY_LEFTMETA 1] [KEY_SPACE 1] [KEY_SPACE 0] [KEY_LEFTMETA 0]
+                   [KEY_A 1] [KEY_A 0]
+                   [KEY_RIGHTSHIFT 1] [KEY_B 1] [KEY_B 0] [KEY_RIGHTSHIFT 0]])]
+      (assert= 1 @fired "times the menu action ran")
+      (assert= #{} (held-on-output events) "keys left down")
+      (assert= true (no-ev? events KEY_LEFTSHIFT 1) "no left Shift press")))
+
+  (deftest "right Alt and right Super come out as themselves"
+    (doseq [m [KEY_RIGHTALT KEY_RIGHTMETA]]
+      (assert= [[m 1] [KEY_H 1] [KEY_H 0] [m 0]]
+               (pipeline-events [[m 1] [KEY_H 1] [KEY_H 0] [m 0]])
+               (str "output for " m))))
+
+  (deftest "Shift held while the modal opens is released on output"
+    (assert= [[KEY_LEFTSHIFT 1] [KEY_LEFTSHIFT 0]]
+             (pipeline-events
+              [[KEY_LEFTSHIFT 1]
+               [KEY_LEFTMETA 1] [KEY_SPACE 1] [KEY_SPACE 0] [KEY_LEFTMETA 0]
+               [KEY_LEFTSHIFT 0]
+               [KEY_ESC 1] [KEY_ESC 0]])
+             "output"))
+
+  (bridge/disconnect!))
 
 ;; ---- Main ----
 
 (defn -main []
-  (try (setup) (run-tests) (finally (teardown)))
+  (try (setup) (run-tests) (run-pipeline-tests) (finally (teardown)))
   (println)
   (let [{:keys [passed failed errors]} @test-results]
     (println (format "Results: %d passed, %d failed" passed failed))

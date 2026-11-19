@@ -10,6 +10,7 @@
  *   Client -> Bridge:  EM <code> <value>\n
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -31,12 +32,15 @@
 #include <linux/input.h>
 
 #define MAX_DEVICES 16
+#define MAX_EVENT_NODES 256
 #define VKBD_NAME "tecla-virtual-keyboard"
 #define VMOUSE_NAME "tecla-virtual-mouse"
 
 static volatile int running = 1;
 static int debug = 0;
 static int allow_virtual = 0;   /* --allow-virtual: skip phys check (for tests) */
+static const char *only_paths[MAX_DEVICES * 2]; /* --device: grab only these */
+static int only_path_count = 0;
 static dev_t uinput_devnum = 0; /* our virtual keyboard, skip during scan */
 static dev_t umouse_devnum = 0; /* our virtual mouse, skip during scan */
 
@@ -153,9 +157,17 @@ static int fp_has_nomods_binding(int keycode) {
     return 0;
 }
 
+/* BTN_* codes belong to pointers and gamepads. The rest of the EV_KEY
+ * range is keyboard keys, including the extended ones above the buttons. */
+static int is_button(int code) {
+    return (code >= BTN_MISC && code < KEY_OK)
+        || (code >= BTN_DPAD_UP && code <= BTN_DPAD_RIGHT)
+        || (code >= BTN_TRIGGER_HAPPY && code <= BTN_TRIGGER_HAPPY40);
+}
+
 static void fp_emit(int code, int value) {
     struct libevdev_uinput *target =
-        (code >= BTN_MISC && umouse) ? umouse : uidev;
+        (is_button(code) && umouse) ? umouse : uidev;
     libevdev_uinput_write_event(target, EV_KEY, code, value);
     libevdev_uinput_write_event(target, EV_SYN, SYN_REPORT, 0);
 }
@@ -169,61 +181,34 @@ static void fp_reset(void) {
 }
 
 static void fp_release_stuck(void) {
-    int any_key = 0, any_btn = 0;
     for (int i = 0; i <= KEY_MAX; i++) {
         if (fp_sent[i]) {
-            if (i >= BTN_MISC && umouse) {
-                libevdev_uinput_write_event(umouse, EV_KEY, i, 0);
-                any_btn = 1;
-            } else {
-                libevdev_uinput_write_event(uidev, EV_KEY, i, 0);
-                any_key = 1;
-            }
+            fp_emit(i, 0);
             fp_sent[i] = 0;
         }
     }
-    if (any_key)
-        libevdev_uinput_write_event(uidev, EV_SYN, SYN_REPORT, 0);
-    if (any_btn)
-        libevdev_uinput_write_event(umouse, EV_SYN, SYN_REPORT, 0);
 }
 
 static void fp_route_key(int code, int value) {
-    if (!fp_active) {
-        /* Intercept-all mode: everything to client, but track state */
-        int rc = send_to_client("EV %d %d\n", code, value);
-        int mbit = fp_mod_bit(code);
-        if (mbit) {
-            if (value) fp_mod_state |= mbit;
-            else       fp_mod_state &= ~mbit;
-        }
-        if (value == 1) {
-            fp_sent[code] = 1;
-        } else if (value == 0) {
-            /* If send failed for a release, emit directly to prevent
-             * the key getting stuck in the pressed state. */
-            if (rc < 0) fp_emit(code, 0);
-            fp_sent[code] = 0;
-        }
-        return;
-    }
-
-    /* Fast-path passthrough mode */
     int mbit = fp_mod_bit(code);
-    int to_client = 0;
 
     if (value == 1) { /* press */
-        if (mbit) {
-            fp_mod_state |= mbit;
+        int to_client;
+        if (mbit) fp_mod_state |= mbit;
+        if (!fp_active)   /* intercept-all mode */
+            to_client = 1;
+        else if (mbit)
             to_client = (mbit & fp_intercept_mod_mask) != 0;
-        } else {
+        else
             to_client = ((fp_mod_state & fp_intercept_mod_mask) != 0)
                      || fp_has_nomods_binding(code);
-        }
         fp_sent[code] = to_client;
         if (to_client) send_to_client("EV %d %d\n", code, value);
         else           fp_emit(code, value);
     } else { /* release */
+        /* A release goes where its press went, whatever the mode is by
+         * then: the client never saw a press that was emitted here, and
+         * would leave that key down on the virtual keyboard. */
         if (mbit) fp_mod_state &= ~mbit;
         if (fp_sent[code]) {
             if (send_to_client("EV %d %d\n", code, value) < 0)
@@ -281,10 +266,35 @@ static int is_mouse(struct libevdev *d) {
         && libevdev_has_event_code(d, EV_KEY, BTN_LEFT);
 }
 
+static int is_event_node(const struct dirent *e) {
+    return strncmp(e->d_name, "event", 5) == 0;
+}
+
+static int by_event_number(const struct dirent **a, const struct dirent **b) {
+    return atoi((*a)->d_name + 5) - atoi((*b)->d_name + 5);
+}
+
+/* Event numbers present in /dev/input, ascending. The kernel numbers the
+ * nodes past the first 32 from 256 up, so no fixed range covers them. */
+static int event_numbers(int *nums, int max) {
+    struct dirent **ents;
+    int n = scandir("/dev/input", &ents, is_event_node, by_event_number);
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        if (count < max) nums[count++] = atoi(ents[i]->d_name + 5);
+        free(ents[i]);
+    }
+    if (n >= 0) free(ents);
+    return count;
+}
+
 static void list_devices(void) {
     char path[64];
+    int nums[MAX_EVENT_NODES];
+    int n = event_numbers(nums, MAX_EVENT_NODES);
     printf("Available input devices:\n\n");
-    for (int i = 0; i < 64; i++) {
+    for (int k = 0; k < n; k++) {
+        int i = nums[k];
         snprintf(path, sizeof(path), "/dev/input/event%d", i);
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
@@ -360,14 +370,25 @@ static int is_own_device(const char *path) {
     return 0;
 }
 
+/* With --device, only the listed paths are candidates for a grab */
+static int path_allowed(const char *path) {
+    if (only_path_count == 0) return 1;
+    for (int i = 0; i < only_path_count; i++)
+        if (strcmp(only_paths[i], path) == 0) return 1;
+    return 0;
+}
+
 /* Scan for keyboards, grab any new ones. Returns total device count. */
 static int grab_keyboards(void) {
     char path[64];
-    for (int i = 0; i < 64 && device_count < MAX_DEVICES; i++) {
+    int nums[MAX_EVENT_NODES];
+    int n = event_numbers(nums, MAX_EVENT_NODES);
+    for (int k = 0; k < n && device_count < MAX_DEVICES; k++) {
+        int i = nums[k];
         if (already_grabbed(i)) continue;
 
         snprintf(path, sizeof(path), "/dev/input/event%d", i);
-        if (is_own_device(path)) continue;
+        if (is_own_device(path) || !path_allowed(path)) continue;
 
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
@@ -402,11 +423,14 @@ static int grab_keyboards(void) {
 /* Scan for mice, grab any new ones. Returns total mouse count. */
 static int grab_mice(void) {
     char path[64];
-    for (int i = 0; i < 64 && mouse_count < MAX_DEVICES; i++) {
+    int nums[MAX_EVENT_NODES];
+    int n = event_numbers(nums, MAX_EVENT_NODES);
+    for (int k = 0; k < n && mouse_count < MAX_DEVICES; k++) {
+        int i = nums[k];
         if (already_grabbed(i)) continue;
 
         snprintf(path, sizeof(path), "/dev/input/event%d", i);
-        if (is_own_device(path)) continue;
+        if (is_own_device(path) || !path_allowed(path)) continue;
 
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
@@ -440,6 +464,35 @@ static int grab_mice(void) {
     return mouse_count;
 }
 
+/* Virtual keyboard with every key code: what it can emit does not depend
+ * on which keyboard was grabbed first. Bus and ids follow that keyboard,
+ * because libinput reads them to tell internal keyboards from external.
+ * No EV_REP: the compositor repeats keys, a second source would race it. */
+static int create_virtual_keyboard(const struct libevdev *like) {
+    struct libevdev *dev = libevdev_new();
+    if (!dev) return -ENOMEM;
+
+    libevdev_set_name(dev, VKBD_NAME);
+    libevdev_set_id_bustype(dev, libevdev_get_id_bustype(like));
+    libevdev_set_id_vendor(dev, libevdev_get_id_vendor(like));
+    libevdev_set_id_product(dev, libevdev_get_id_product(like));
+    libevdev_set_id_version(dev, libevdev_get_id_version(like));
+
+    libevdev_enable_event_type(dev, EV_KEY);
+    for (int code = KEY_ESC; code <= KEY_MAX; code++)
+        if (!is_button(code))
+            libevdev_enable_event_code(dev, EV_KEY, code, NULL);
+
+    libevdev_enable_event_type(dev, EV_LED);
+    for (int led = LED_NUML; led <= LED_SCROLLL; led++)
+        libevdev_enable_event_code(dev, EV_LED, led, NULL);
+
+    int rc = libevdev_uinput_create_from_device(
+        dev, LIBEVDEV_UINPUT_OPEN_MANAGED, &uidev);
+    libevdev_free(dev);
+    return rc;
+}
+
 /* ---- Socket ---- */
 
 static int setup_socket(const char *path) {
@@ -465,12 +518,8 @@ static int line_buf_len = 0;
 static void process_command(char *line) {
     if (strncmp(line, "EM ", 3) == 0) {
         int code, value;
-        if (sscanf(line + 3, "%d %d", &code, &value) == 2) {
-            struct libevdev_uinput *target =
-                (code >= BTN_MISC && umouse) ? umouse : uidev;
-            libevdev_uinput_write_event(target, EV_KEY, code, value);
-            libevdev_uinput_write_event(target, EV_SYN, SYN_REPORT, 0);
-        }
+        if (sscanf(line + 3, "%d %d", &code, &value) == 2)
+            fp_emit(code, value);
     } else if (strncmp(line, "BIND ", 5) == 0) {
         int mod_mask, keycode;
         if (sscanf(line + 5, "%d %d", &mod_mask, &keycode) == 2
@@ -522,6 +571,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--list") == 0) { list_devices(); return 0; }
         else if (strcmp(argv[i], "--debug") == 0) debug = 1;
         else if (strcmp(argv[i], "--allow-virtual") == 0) allow_virtual = 1;
+        else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc
+                 && only_path_count < MAX_DEVICES * 2)
+            only_paths[only_path_count++] = argv[++i];
         else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc)
             timeout_sec = atoi(argv[++i]);
         else if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc)
@@ -551,30 +603,7 @@ int main(int argc, char **argv) {
     grab_mice();
     fprintf(stderr, "Grabbed %d mouse/mice\n", mouse_count);
 
-    /* Give the virtual keyboard a recognisable name so is_keyboard()
-     * can skip it during rescan.  libevdev_uinput_create_from_device
-     * copies the source device's input_id (including bus type), so
-     * the BUS_VIRTUAL check alone is not enough. */
-    const char *orig_name = libevdev_get_name(devices[0].dev);
-    libevdev_set_name(devices[0].dev, VKBD_NAME);
-
-    /* Disable autorepeat on virtual keyboard.
-     * On Wayland the compositor handles repeat via its own timer;
-     * kernel-level EV_REP on the virtual device just adds a second
-     * source of repeats that races with the round-trip latency. */
-    int had_rep = libevdev_has_event_type(devices[0].dev, EV_REP);
-    if (had_rep)
-        libevdev_disable_event_type(devices[0].dev, EV_REP);
-
-    int rc = libevdev_uinput_create_from_device(
-        devices[0].dev, LIBEVDEV_UINPUT_OPEN_MANAGED, &uidev);
-
-    /* Restore the grabbed device's original name and repeat cap */
-    if (orig_name)
-        libevdev_set_name(devices[0].dev, orig_name);
-    if (had_rep)
-        libevdev_enable_event_type(devices[0].dev, EV_REP);
-
+    int rc = create_virtual_keyboard(devices[0].dev);
     if (rc < 0) {
         fprintf(stderr, "uinput: %s\n", strerror(-rc));
         return 1;

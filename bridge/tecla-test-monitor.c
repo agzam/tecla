@@ -1,10 +1,7 @@
 /*
- * tecla-test-monitor - reads key events from a device, prints to stdout
- *
- * Opens a device WITHOUT grabbing it (just observes), prints EV_KEY events
- * as "CODE VALUE\n" lines to stdout. Used by integration tests to verify
- * what the bridge's virtual keyboard actually emits.
- *
+ * tecla-test-monitor - grabs a device and prints its EV_KEY events to stdout
+ * as "CODE VALUE" lines, so tests can check what the bridge's virtual
+ * keyboard emits. The grab keeps that output away from a running compositor.
  * Usage: tecla-test-monitor /dev/input/event25
  */
 
@@ -50,6 +47,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    rc = libevdev_grab(dev, LIBEVDEV_GRAB);
+    if (rc < 0) {
+        fprintf(stderr, "Cannot grab %s: %s\n", argv[1], strerror(-rc));
+        libevdev_free(dev);
+        close(fd);
+        return 1;
+    }
+
     fprintf(stderr, "monitor: watching %s (%s)\n",
             argv[1], libevdev_get_name(dev));
 
@@ -70,6 +75,7 @@ int main(int argc, char **argv) {
 
         do {
             rc = libevdev_next_event(dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+            if (rc == -ENODEV) running = 0; /* device removed */
             if (rc < 0) break;
 
             if (ev.type == EV_KEY) {
