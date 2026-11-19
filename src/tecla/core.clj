@@ -25,20 +25,32 @@
 ;; ----------------------------------------------------------------
 
 (defonce kbd-state
-  (atom {:mod-state 0
+  (atom {:mod-state 0         ;; bitmask of the modifiers held
+         :held-mods #{}       ;; keycodes of the modifier keys held
          :buffered-mods 0
          :consumed-mods 0
          :active-sims {}      ;; code -> {:from-mods :to-combo} for key release
          :buffer-mods 0}))    ;; bitmask of mods to buffer (from keymap scan)
 
-(defn- update-mod-state [state code value]
-  (let [bit (keys/code->mod-bit code)]
-    (if (zero? bit)
-      state
-      (update state :mod-state
-              (if (= value 1)
-                #(bit-or % bit)
-                #(bit-and % (bit-not bit)))))))
+(defn- update-mod-state
+  "Track the modifier keys held. Left and right keys share a bit in
+   :mod-state, so the bit follows the set of keycodes still down."
+  [state code value]
+  (if-not (keys/modifier-code? code)
+    state
+    (let [held ((if (= value 1) conj disj) (or (:held-mods state) #{}) code)]
+      (assoc state
+             :held-mods held
+             :mod-state (reduce bit-or 0 (map keys/code->mod-bit held))))))
+
+(defn- press-held-mods!
+  "Press the held modifier keys covered by bitmask `bits`, each under its
+   own keycode. A release reaches the output under the keycode that went
+   up, so a press under the twin's keycode would never be released."
+  [kbd bits]
+  (doseq [code (sort (:held-mods kbd))
+          :when (pos? (bit-and bits (keys/code->mod-bit code)))]
+    (bridge/emit! code 1)))
 
 (defn compute-buffer-mods
   "Scan keymap for modifier bits that need buffering."
@@ -265,11 +277,8 @@
       :exit-modal (do
                     (stop-repeat!)
                     (reset! pre-modal-window nil)
-                    (swap! kbd-state assoc :buffered-mods 0 :consumed-mods 0)
-                    (let [ms (:mod-state @kbd-state)]
-                      (doseq [bit [1 2 4 8]]
-                        (when (pos? (bit-and ms bit))
-                          (bridge/emit! (keys/mod-bit->code bit) 1))))
+                    (let [kbd (swap! kbd-state assoc :buffered-mods 0 :consumed-mods 0)]
+                      (press-held-mods! kbd (:mod-state kbd)))
                     ;; Rebind for the (possibly changed) focused app,
                     ;; also sets passthrough mode
                     (let [keymap (effective-keymap (:config @fsm-state))]
@@ -287,11 +296,10 @@
 ;; ----------------------------------------------------------------
 
 (defn- flush-buffered-mods! [state]
-  (let [buf (:buffered-mods @state)]
+  (let [kbd @state
+        buf (:buffered-mods kbd)]
     (when-not (zero? buf)
-      (doseq [bit [1 2 4 8]]
-        (when-not (zero? (bit-and buf bit))
-          (bridge/emit! (keys/mod-bit->code bit) 1)))
+      (press-held-mods! kbd buf)
       (swap! state assoc :buffered-mods 0))))
 
 ;; ----------------------------------------------------------------
@@ -314,11 +322,11 @@
       ;; === MODAL MODE ===
       (= :modal (:mode @fsm-state))
       (cond
-        ;; Modifiers are tracked (mod-state updated above) but NOT
-        ;; emitted during modal mode. They are only used for matching
-        ;; modifier+key menu entries like [:shift :b]. On exit-modal,
-        ;; any still-held modifiers are re-emitted for passthrough.
-        is-mod nil
+        ;; Modifier presses are tracked (mod-state updated above) but NOT
+        ;; emitted in modal mode: they only select entries like [:shift :b],
+        ;; and exit-modal presses the ones still held. A release is emitted:
+        ;; the modifier may be down on the output from before the modal.
+        is-mod (when release? (bridge/emit! code 0))
 
         press?
         (let [key-kw (keys/code->key code)
@@ -333,7 +341,10 @@
           (swap! fsm-state assoc :effect nil))
 
         release?
-        (stop-repeat!))
+        (do (stop-repeat!)
+            ;; The key, or a remap of it, may be down from before the modal
+            (when-not (handle-sim-release! state code)
+              (bridge/emit! code 0))))
 
       ;; === PASSTHROUGH MODE ===
 
@@ -347,16 +358,20 @@
 
       ;; Modifier release
       (and is-mod release?)
-      (let [bit (keys/code->mod-bit code)]
-        (cond
-          (pos? (bit-and bit (:consumed-mods @state)))
-          (swap! state update :consumed-mods #(bit-and % (bit-not bit)))
-
-          (pos? (bit-and bit (:buffered-mods @state)))
-          (do (bridge/emit! code 1) (bridge/emit! code 0)
-              (swap! state update :buffered-mods #(bit-and % (bit-not bit))))
-
-          :else (bridge/emit! code value)))
+      (let [bit (keys/code->mod-bit code)
+            kbd @state
+            tap? (and (zero? (bit-and bit (:consumed-mods kbd)))
+                      (pos? (bit-and bit (:buffered-mods kbd))))]
+        ;; Buffered and never used: the key was tapped on its own
+        (when tap? (bridge/emit! code 1))
+        ;; Released in every case: the kernel drops a release of a key
+        ;; that is up, and a release that is missing leaves the key stuck
+        (bridge/emit! code 0)
+        ;; The other key of this modifier may still be down
+        (when (zero? (bit-and bit (:mod-state kbd)))
+          (swap! state #(-> %
+                            (update :consumed-mods bit-and (bit-not bit))
+                            (update :buffered-mods bit-and (bit-not bit))))))
 
       ;; Non-modifier key press
       press?

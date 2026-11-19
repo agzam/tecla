@@ -128,13 +128,3 @@
     (56 100)  (:alt mod-bits)
     (125 126) (:meta mod-bits)
     0))
-
-(defn mod-bit->code
-  "Return the left-side keycode for a modifier bitmask bit."
-  [bit]
-  (case (int bit)
-    1 29    ;; CTRL -> KEY_LEFTCTRL
-    2 42    ;; SHIFT -> KEY_LEFTSHIFT
-    4 56    ;; ALT -> KEY_LEFTALT
-    8 125   ;; META -> KEY_LEFTMETA
-    nil))

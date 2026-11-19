@@ -70,13 +70,15 @@
     :brave-browser
     {[:ctrl :p] [:pageup]}}})
 
-(defn reset-state! []
-  (reset! core/fsm-state (fsm/init config))
+(defn reset-with! [cfg]
+  (reset! core/fsm-state (fsm/init cfg))
   (reset! core/focused-app nil)
   (reset! core/kbd-state
-          {:mod-state 0 :buffered-mods 0 :consumed-mods 0
-           :active-sims {} :buffer-mods (core/compute-buffer-mods (:global-keymap config))})
+          {:mod-state 0 :held-mods #{} :buffered-mods 0 :consumed-mods 0
+           :active-sims {} :buffer-mods (core/compute-buffer-mods (:global-keymap cfg))})
   (clear!))
+
+(defn reset-state! [] (reset-with! config))
 
 (defn reset-state-with-app!
   "Reset state and simulate being focused on a specific app."
@@ -384,6 +386,103 @@
   ;; Ctrl and N should pass through (no remap)
   (assert= true (emitted? CTRL 1) "Ctrl passed through")
   (assert= true (emitted? KEY_N 1) "N passed through"))
+
+;; ---- Stuck keys: left and right modifier keys, releases in modal mode ----
+
+(def RCTRL 97) (def RSHIFT 54) (def RALT 100) (def RSUPER 126)
+
+(defn held-on-output
+  "Keycodes still down on the virtual keyboard, replayed from `emitted`."
+  []
+  (reduce (fn [down [code value]]
+            (if (= 1 value) (conj down code) (disj down code)))
+          #{} @emitted))
+
+(def noop (fn []))
+
+(def mods-config
+  "Every modifier appears in a combo, so each modifier key gets buffered."
+  {:global-keymap
+   {[:ctrl :1] noop
+    [:shift :1] noop
+    [:alt :1] noop
+    [:super :1] noop
+    [:super :t] [:ctrl :shift :t]
+    [:super :space]
+    {:desc "Main"
+     :keys {:a {:desc "Apps"
+                :keys {:e {:desc "Emacs" :action noop}
+                       [:shift :b] {:desc "Brave Private" :action noop}}}}}}})
+
+(deftest "modal: Shift+B with either Shift key leaves no key down"
+  (doseq [shift [SHIFT RSHIFT]]
+    (reset-state!)
+    (combo SUPER SPACE) (tap KEY_A)
+    (press shift) (tap KEY_B) (release shift)
+    (assert= :idle (:mode @core/fsm-state) "back to idle")
+    (assert= #{} (held-on-output) (str "keys down after Shift " shift))))
+
+(deftest "buffered modifier is flushed as the key that is down"
+  (doseq [[m twin] [[CTRL RCTRL] [RCTRL CTRL] [SHIFT RSHIFT] [RSHIFT SHIFT]
+                    [ALT RALT] [RALT ALT] [SUPER RSUPER] [RSUPER SUPER]]]
+    (reset-with! mods-config)
+    (press m) (press KEY_H)
+    (assert= #{m KEY_H} (held-on-output) (str "keys down while holding " m))
+    (assert= true (not-emitted? twin 1) (str "twin of " m))
+    (release KEY_H) (release m)
+    (assert= #{} (held-on-output) (str "keys down after " m))))
+
+(deftest "modifier flushed before the modal is released inside it"
+  (reset-state!)
+  (press SUPER) (tap KEY_H)       ;; no binding: Super goes to the output
+  (press SPACE)                   ;; Super+Space enters modal
+  (assert= :modal (:mode @core/fsm-state) "modal")
+  (release SPACE) (release SUPER)
+  (assert= #{} (held-on-output) "keys down"))
+
+(deftest "remap is released when its key goes up in modal mode"
+  (reset-state!)
+  (press SUPER) (press KEY_T)     ;; Ctrl+T held
+  (press SPACE)                   ;; Super+Space enters modal
+  (assert= :modal (:mode @core/fsm-state) "modal")
+  (release KEY_T)
+  (assert= #{} (held-on-output) "keys down")
+  (assert= {} (:active-sims @core/kbd-state) "sims"))
+
+(deftest "one Shift key stays in effect when the other goes up"
+  (reset-with! mods-config)
+  (press RSHIFT) (press SHIFT) (release RSHIFT)
+  (assert= 2 (:mod-state @core/kbd-state) "Shift bit")
+  (press KEY_H)
+  (assert= #{SHIFT KEY_H} (held-on-output) "keys down while typing H")
+  (release KEY_H) (release SHIFT)
+  (assert= #{} (held-on-output) "keys down"))
+
+(defn random-steps
+  "A sequence a keyboard can produce: a key goes down only while it is up,
+   and after `n` steps the held keys go up in random order."
+  [^java.util.Random rnd codes n]
+  (loop [i 0, down #{}, steps []]
+    (let [pool (if (< i n) codes (vec (sort down)))]
+      (if (empty? pool)
+        steps
+        (let [code (nth pool (.nextInt rnd (count pool)))
+              value (if (down code) 0 1)]
+          (recur (inc i)
+                 ((if (= 1 value) conj disj) down code)
+                 (conj steps [code value])))))))
+
+(deftest "random key sequences leave no key down"
+  (let [rnd (java.util.Random. 42)
+        codes [CTRL RCTRL SHIFT RSHIFT ALT RALT SUPER RSUPER SPACE
+               KEY_A KEY_B KEY_E KEY_T KEY_H KEY_ESC (keys/key->code :1)]]
+    (dotimes [_ 300]
+      (let [steps (random-steps rnd codes 30)]
+        (reset-with! mods-config)
+        ;; entering modal prints a wm warning per sequence
+        (with-out-str (doseq [[code value] steps] (core/on-key-event code value)))
+        (assert= #{} (held-on-output) (str "keys down after " (pr-str steps)))
+        (assert= 0 (:mod-state @core/kbd-state) (str "mods after " (pr-str steps)))))))
 
 ;; ================================================================
 (println)
