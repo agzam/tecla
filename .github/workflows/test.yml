@@ -30,6 +30,9 @@ jobs:
       - name: Run edit-with-emacs tests
         run: bb test/emacs_test.clj
 
+      - name: Run autostart task tests
+        run: bb test/autostart_test.clj
+
   elisp-tests:
     name: Elisp tests (tecla.el)
     runs-on: ubuntu-latest

@@ -40,8 +40,32 @@
   test:hyprland-live {:doc "Run wm actions against a nested Hyprland (needs HYPRLAND_INSTANCE_SIGNATURE of it, kitty)"
                       :task (shell "bb test/hyprland_live.clj")}
 
+  test:autostart {:doc "Run the setup:gnome-autostart task test"
+                  :task (shell "bb test/autostart_test.clj")}
+
   test {:doc "Run all unit tests"
-        :depends [test:fsm test:core test:emacs test:hyprland]}
+        :depends [test:fsm test:core test:emacs test:hyprland test:autostart]}
+
+  setup:gnome-autostart
+  {:doc "Start tecla at GNOME login (writes ~/.config/autostart/tecla.desktop)"
+   :task
+   (let [config-home (or (System/getenv "XDG_CONFIG_HOME")
+                         (str (System/getProperty "user.home") "/.config"))
+         entry (clojure.java.io/file config-home "autostart" "tecla.desktop")
+         bb (.. (java.lang.ProcessHandle/current) info command get)]
+     (.mkdirs (.getParentFile entry))
+     ;; Path is the working directory: bb.edn, the bridge and the HUD script
+     ;; are found relative to it. OnlyShowIn leaves the other desktops, which
+     ;; start tecla their own way, without a second instance.
+     (spit entry
+           (str "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=Tecla\n"
+                "Comment=Modal keyboard toolkit\n"
+                "Exec=" bb " run\n"
+                "Path=" (System/getProperty "user.dir") "\n"
+                "OnlyShowIn=GNOME;\n"))
+     (println "Wrote" (str entry)))}
 
   setup:gnome
   {:doc "Install the window-calls GNOME Shell extension (needed for focus-or-launch on GNOME/Wayland)"
